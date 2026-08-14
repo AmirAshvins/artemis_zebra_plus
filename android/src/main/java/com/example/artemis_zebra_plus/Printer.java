@@ -37,6 +37,7 @@ import com.zebra.sdk.comm.Connection;
 import com.zebra.sdk.comm.ConnectionException;
 import com.zebra.sdk.comm.TcpConnection;
 import com.zebra.sdk.printer.PrinterStatus;
+import com.zebra.sdk.printer.SGD;
 import com.zebra.sdk.printer.ZebraPrinter;
 import com.zebra.sdk.printer.ZebraPrinterFactory;
 import com.zebra.sdk.printer.ZebraPrinterLanguageUnknownException;
@@ -521,6 +522,56 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
         }
     }
 
+    /**
+     * Link-OS battery via SGD on the open connection. Returns null when the
+     * printer is AC-powered, SGD is missing, or the value cannot be parsed.
+     * Never uses 0 as a stand-in for "unknown".
+     */
+    private Integer readBatteryPercent(Connection connection) {
+        try {
+            String source = SGD.GET("power.source", connection);
+            if (isAcPowerSource(source)) {
+                return null;
+            }
+            return parseBatteryPercent(SGD.GET("power.percent", connection));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean isAcPowerSource(String source) {
+        if (source == null) {
+            return false;
+        }
+        String src = source.trim().toUpperCase();
+        return src.contains("LINE") || src.contains("AC") || src.contains("MAINS");
+    }
+
+    /**
+     * Parses a 0–100 integer from SGD power.percent (optional trailing %).
+     */
+    static Integer parseBatteryPercent(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String s = raw.trim();
+        if (s.endsWith("%")) {
+            s = s.substring(0, s.length() - 1).trim();
+        }
+        if (s.isEmpty()) {
+            return null;
+        }
+        try {
+            int n = Integer.parseInt(s);
+            if (n < 0 || n > 100) {
+                return null;
+            }
+            return n;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     public void checkPrinterStatus(final MethodChannel.Result result) {
 //        result.success("Not Connected");
 //        return;
@@ -555,6 +606,11 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
                         arguments.put("numberOfFormatsInReceiveBuffer", myPrinterStatus.numberOfFormatsInReceiveBuffer);
                         arguments.put("printMode", myPrinterStatus.printMode);
                         arguments.put("labelsRemainingInBatch", myPrinterStatus.labelsRemainingInBatch);
+                        // SGD is not part of getCurrentStatus(); omit the key when unknown so Dart stays null.
+                        Integer batteryPercent = readBatteryPercent(printerConnection);
+                        if (batteryPercent != null) {
+                            arguments.put("batteryPercent", batteryPercent);
+                        }
 
                         JsonAdapter<Map> adapter = moshi.adapter(Map.class);
                         result.success(adapter.toJson(arguments));

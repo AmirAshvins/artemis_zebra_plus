@@ -79,6 +79,9 @@ class ZebraPrinterStatus {
   final bool isHeadCold;
   final int printMode;
 
+  /// Link-OS SGD `power.percent` (0–100). Null when unknown, AC-powered, or SGD failed.
+  final int? batteryPercent;
+
   ZebraPrinterStatus({
     required this.isPaused,
     required this.numberOfFormatsInReceiveBuffer,
@@ -93,6 +96,7 @@ class ZebraPrinterStatus {
     required this.isHeadOpen,
     required this.isHeadCold,
     required this.printMode,
+    this.batteryPercent,
   });
 
   ZebraPrinterStatus copyWith({
@@ -109,6 +113,7 @@ class ZebraPrinterStatus {
     bool? isHeadOpen,
     bool? isHeadCold,
     int? printMode,
+    int? batteryPercent,
   }) =>
       ZebraPrinterStatus(
         isPaused: isPaused ?? this.isPaused,
@@ -123,9 +128,32 @@ class ZebraPrinterStatus {
         labelsRemainingInBatch: labelsRemainingInBatch ?? this.labelsRemainingInBatch,
         isHeadOpen: isHeadOpen ?? this.isHeadOpen,
         isHeadCold: isHeadCold ?? this.isHeadCold,
-
         printMode: printMode ?? this.printMode,
+        batteryPercent: batteryPercent ?? this.batteryPercent,
       );
+
+  /// Parses SGD / JSON battery values. Missing, null, or unparseable → null (never fake 0).
+  static int? parseBatteryPercent(dynamic value) {
+    if (value == null) return null;
+    String raw;
+    if (value is int) {
+      if (value < 0 || value > 100) return null;
+      return value;
+    }
+    if (value is num) {
+      final n = value.round();
+      if (n < 0 || n > 100) return null;
+      return n;
+    }
+    raw = value.toString().trim();
+    if (raw.endsWith('%')) {
+      raw = raw.substring(0, raw.length - 1).trim();
+    }
+    if (raw.isEmpty) return null;
+    final n = int.tryParse(raw);
+    if (n == null || n < 0 || n > 100) return null;
+    return n;
+  }
 
   factory ZebraPrinterStatus.fromJson(Map<String, dynamic> json) => ZebraPrinterStatus(
     isPaused: json["isPaused"],
@@ -141,6 +169,7 @@ class ZebraPrinterStatus {
     isHeadOpen: json["isHeadOpen"],
     isHeadCold: json["isHeadCold"],
     printMode: json["printMode"],
+    batteryPercent: parseBatteryPercent(json["batteryPercent"]),
   );
 
   Map<String, dynamic> toJson() => {
@@ -157,6 +186,7 @@ class ZebraPrinterStatus {
     "isHeadOpen": isHeadOpen,
     "isHeadCold": isHeadCold,
     "printMode": printMode,
+    "batteryPercent": batteryPercent,
   };
 
 
@@ -189,5 +219,6 @@ class ZebraPrinterStatus {
     isHeadOpen: false,
     isHeadCold: false,
     printMode: 0,
+    batteryPercent: null,
   );
 }
