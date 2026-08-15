@@ -290,7 +290,7 @@ class Printer{
             // Get the current status of the printer.
             let printerStatus = try printer.getCurrentStatus()
             let status = MyPrinterStatus(isReadyToPrint: printerStatus.isReadyToPrint, isHeadOpen: printerStatus.isHeadOpen, isHeadCold: printerStatus.isHeadCold, isHeadTooHot: printerStatus.isHeadTooHot, isPaperOut: printerStatus.isPaperOut, isRibbonOut: printerStatus.isRibbonOut, isReceiveBufferFull: printerStatus.isReceiveBufferFull, isPaused: printerStatus.isPaused, labelLengthInDots: printerStatus.labelLengthInDots, numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer, labelsRemainingInBatch: printerStatus.labelsRemainingInBatch, isPartialFormatInProgress: printerStatus.isPartialFormatInProgress, printMode: printerStatus.printMode.rawValue)
-            status.batteryPercent = BatterySgd.batteryPercentFromConnection(zebraPrinterConnection)?.intValue
+            status.batteryPercent = BatterySgd.batteryPercent(fromConnection: zebraPrinterConnection)?.intValue
             
             let jsonEncoder = JSONEncoder()
             let jsonData = try! jsonEncoder.encode(status)
@@ -311,7 +311,7 @@ class Printer{
                 // Get the current status of the printer.
                 let printerStatus = try printer.getCurrentStatus()
                 let status = MyPrinterStatus(isReadyToPrint: printerStatus.isReadyToPrint, isHeadOpen: printerStatus.isHeadOpen, isHeadCold: printerStatus.isHeadCold, isHeadTooHot: printerStatus.isHeadTooHot, isPaperOut: printerStatus.isPaperOut, isRibbonOut: printerStatus.isRibbonOut, isReceiveBufferFull: printerStatus.isReceiveBufferFull, isPaused: printerStatus.isPaused, labelLengthInDots: printerStatus.labelLengthInDots, numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer, labelsRemainingInBatch: printerStatus.labelsRemainingInBatch, isPartialFormatInProgress: printerStatus.isPartialFormatInProgress, printMode: printerStatus.printMode.rawValue)
-                status.batteryPercent = BatterySgd.batteryPercentFromConnection(zebraPrinterConnection)?.intValue
+                status.batteryPercent = BatterySgd.batteryPercent(fromConnection: zebraPrinterConnection)?.intValue
                 
                 let jsonEncoder = JSONEncoder()
                 let jsonData = try! jsonEncoder.encode(status)
