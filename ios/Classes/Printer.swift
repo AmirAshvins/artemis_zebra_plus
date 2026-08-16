@@ -57,7 +57,11 @@ class Printer{
                 break
                 
             case "checkPrinterStatus":
-                self.checkPrinterStatus(result: result)
+                // Flutter Bool arrives as NSNumber on iOS — `as? Bool` silently fails.
+                let sgdOnly = (myArgs?["sgdOnly"] as? NSNumber)?.boolValue
+                    ?? (myArgs?["sgdOnly"] as? Bool)
+                    ?? false
+                self.checkPrinterStatus(sgdOnly: sgdOnly, result: result)
                 break
                 
             case "sendZplOverTcp":
@@ -268,25 +272,55 @@ class Printer{
         }
     }
     
-    func checkPrinterStatus(result: @escaping FlutterResult) {
+    func checkPrinterStatus(sgdOnly: Bool = false, result: @escaping FlutterResult) {
         // Instantiate connection for TCP port at the given address.
          DispatchQueue.global(qos: .utility).async {
+        let connDesc: String
+        if self.connection == nil {
+            connDesc = "nil"
+        } else if self.connection is TcpPrinterConnection {
+            connDesc = "TCP connected=\((self.connection as? TcpPrinterConnection)?.isConnected() == true)"
+        } else if self.connection is MfiBtPrinterConnection {
+            connDesc = "BT connected=\((self.connection as? MfiBtPrinterConnection)?.isConnected() == true)"
+        } else {
+            connDesc = "other"
+        }
+        NSLog("[Zebra checkPrinterStatus] ENTER instance=%@ sgdOnly=%@ connection=%@",
+              self.toString(), sgdOnly ? "true" : "false", connDesc)
+
         if(self.connection==nil){
+            NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (nil) instance=%@", self.toString())
             result("Not Connected")
             return
         }
         if let zebraPrinterConnection = self.connection as? TcpPrinterConnection {
+            // Battery polls must not reopen a dead socket — that fights the live shared session.
             if !zebraPrinterConnection.isConnected() {
+                if sgdOnly {
+                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (TCP dead, sgdOnly) instance=%@", self.toString())
+                    result("Not Connected")
+                    return
+                }
                 _ = zebraPrinterConnection.open()
             }
-            result(self.statusJson(tcp: zebraPrinterConnection, transport: "TCP"))
+            let json = self.statusJson(tcp: zebraPrinterConnection, transport: "TCP", sgdOnly: sgdOnly)
+            NSLog("[Zebra checkPrinterStatus] EXIT TCP instance=%@ jsonLen=%ld", self.toString(), json.count)
+            result(json)
         } else if let zebraPrinterConnection = self.connection as? MfiBtPrinterConnection {
             if !zebraPrinterConnection.isConnected() {
+                if sgdOnly {
+                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (BT dead, sgdOnly) instance=%@", self.toString())
+                    result("Not Connected")
+                    return
+                }
                 _ = zebraPrinterConnection.open()
             }
-            result(self.statusJson(bt: zebraPrinterConnection, transport: "BT"))
+            let json = self.statusJson(bt: zebraPrinterConnection, transport: "BT", sgdOnly: sgdOnly)
+            NSLog("[Zebra checkPrinterStatus] EXIT BT instance=%@ jsonLen=%ld", self.toString(), json.count)
+            result(json)
         }
         else {
+            NSLog("[Zebra checkPrinterStatus] EXIT Not TCP instance=%@", self.toString())
             result("Not TCP")
             return
         }
@@ -294,9 +328,10 @@ class Printer{
     }
 
     /// TCP overload — concrete type satisfies both factory and BatterySgd/SGD NSObject typing.
-    private func statusJson(tcp connection: TcpPrinterConnection, transport: String) -> String {
+    private func statusJson(tcp connection: TcpPrinterConnection, transport: String, sgdOnly: Bool) -> String {
         return buildStatusJson(
             transport: transport,
+            sgdOnly: sgdOnly,
             loadPrinterStatus: {
                 let printer = try ZebraPrinterFactory.getInstance(connection)
                 return try printer.getCurrentStatus()
@@ -308,9 +343,10 @@ class Printer{
     }
 
     /// MFi BT overload — concrete type satisfies both factory and BatterySgd/SGD NSObject typing.
-    private func statusJson(bt connection: MfiBtPrinterConnection, transport: String) -> String {
+    private func statusJson(bt connection: MfiBtPrinterConnection, transport: String, sgdOnly: Bool) -> String {
         return buildStatusJson(
             transport: transport,
+            sgdOnly: sgdOnly,
             loadPrinterStatus: {
                 let printer = try ZebraPrinterFactory.getInstance(connection)
                 return try printer.getCurrentStatus()
@@ -325,6 +361,7 @@ class Printer{
     /// "Malformed status response"). SGD battery is independent of that API.
     private func buildStatusJson(
         transport: String,
+        sgdOnly: Bool,
         loadPrinterStatus: () throws -> PrinterStatus,
         readBattery: () -> Int?
     ) -> String {
@@ -343,31 +380,34 @@ class Printer{
             isPartialFormatInProgress: false,
             printMode: 0
         )
-        do {
-            let printerStatus = try loadPrinterStatus()
-            status = MyPrinterStatus(
-                isReadyToPrint: printerStatus.isReadyToPrint,
-                isHeadOpen: printerStatus.isHeadOpen,
-                isHeadCold: printerStatus.isHeadCold,
-                isHeadTooHot: printerStatus.isHeadTooHot,
-                isPaperOut: printerStatus.isPaperOut,
-                isRibbonOut: printerStatus.isRibbonOut,
-                isReceiveBufferFull: printerStatus.isReceiveBufferFull,
-                isPaused: printerStatus.isPaused,
-                labelLengthInDots: printerStatus.labelLengthInDots,
-                numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer,
-                labelsRemainingInBatch: printerStatus.labelsRemainingInBatch,
-                isPartialFormatInProgress: printerStatus.isPartialFormatInProgress,
-                printMode: printerStatus.printMode.rawValue
-            )
-        } catch {
-            // ZEBRA_MALFORMED_PRINTER_STATUS_RESPONSE etc. — keep defaults and still read SGD.
-            NSLog("[Zebra checkPrinterStatus] %@ getCurrentStatus failed: %@ — reading SGD battery anyway",
-                  transport, error.localizedDescription)
+        // Periodic battery polls skip getCurrentStatus — it is slow and often malformed.
+        if !sgdOnly {
+            do {
+                let printerStatus = try loadPrinterStatus()
+                status = MyPrinterStatus(
+                    isReadyToPrint: printerStatus.isReadyToPrint,
+                    isHeadOpen: printerStatus.isHeadOpen,
+                    isHeadCold: printerStatus.isHeadCold,
+                    isHeadTooHot: printerStatus.isHeadTooHot,
+                    isPaperOut: printerStatus.isPaperOut,
+                    isRibbonOut: printerStatus.isRibbonOut,
+                    isReceiveBufferFull: printerStatus.isReceiveBufferFull,
+                    isPaused: printerStatus.isPaused,
+                    labelLengthInDots: printerStatus.labelLengthInDots,
+                    numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer,
+                    labelsRemainingInBatch: printerStatus.labelsRemainingInBatch,
+                    isPartialFormatInProgress: printerStatus.isPartialFormatInProgress,
+                    printMode: printerStatus.printMode.rawValue
+                )
+            } catch {
+                // ZEBRA_MALFORMED_PRINTER_STATUS_RESPONSE etc. — keep defaults and still read SGD.
+                NSLog("[Zebra checkPrinterStatus] %@ getCurrentStatus failed: %@ — reading SGD battery anyway",
+                      transport, error.localizedDescription)
+            }
         }
         status.batteryPercent = readBattery()
-        NSLog("[Zebra checkPrinterStatus] %@ batteryPercent=%@",
-              transport, status.batteryPercent.map { "\($0)" } ?? "nil")
+        NSLog("[Zebra checkPrinterStatus] %@ sgdOnly=%@ batteryPercent=%@",
+              transport, sgdOnly ? "true" : "false", status.batteryPercent.map { "\($0)" } ?? "nil")
         let jsonEncoder = JSONEncoder()
         let jsonData = try! jsonEncoder.encode(status)
         return String(data: jsonData, encoding: String.Encoding.utf8) ?? "{}"

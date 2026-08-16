@@ -125,7 +125,8 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
 
 
             case "checkPrinterStatus":
-                checkPrinterStatus(result);
+                Boolean sgdOnlyArg = call.argument("sgdOnly");
+                checkPrinterStatus(result, Boolean.TRUE.equals(sgdOnlyArg));
                 break;
 
             default:
@@ -531,17 +532,25 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
         try {
             String source = SGD.GET("power.source", connection);
             android.util.Log.d("BatterySgd", "power.source raw='" + source + "'");
-            if (isAcPowerSource(source)) {
+            // Missing / garbage source must not block charge reads — only skip on clear AC/line/mains.
+            if (looksLikeValidSgdScalar(source) && isAcPowerSource(source)) {
                 android.util.Log.d("BatterySgd", "skipping percent — AC/line/mains source '" + source + "'");
                 return null;
             }
-            String percentRaw = SGD.GET("power.percent", connection);
-            android.util.Log.d("BatterySgd", "power.percent raw='" + percentRaw + "'");
-            Integer parsed = parseBatteryPercent(percentRaw);
-            if (parsed == null) {
-                String alt = SGD.GET("power.percentage", connection);
-                android.util.Log.d("BatterySgd", "power.percentage raw='" + alt + "'");
-                parsed = parseBatteryPercent(alt);
+            String[] keys = new String[]{
+                    "power.percent_full",
+                    "power.relative_state_of_charge",
+                    "power.percent",
+                    "power.percentage",
+            };
+            Integer parsed = null;
+            for (String key : keys) {
+                String raw = SGD.GET(key, connection);
+                android.util.Log.d("BatterySgd", key + " raw='" + raw + "'");
+                parsed = parseBatteryPercent(raw);
+                if (parsed != null) {
+                    break;
+                }
             }
             android.util.Log.d("BatterySgd", "parsed batteryPercent=" + parsed);
             return parsed;
@@ -567,21 +576,51 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     }
 
     /**
-     * Parses a 0–100 integer from SGD power.percent (optional trailing %).
+     * Rejects leftover host-status blobs that are not valid power.* scalars.
+     */
+    static boolean looksLikeValidSgdScalar(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String s = raw.trim();
+        if (s.isEmpty() || s.length() > 64) {
+            return false;
+        }
+        if (s.contains("^B") || s.contains("^C")) {
+            return false;
+        }
+        if (s.indexOf((char) 0x02) >= 0 || s.indexOf((char) 0x03) >= 0) {
+            return false;
+        }
+        return s.indexOf('\n') < 0;
+    }
+
+    /**
+     * Parses a leading 0–100 integer from SGD strings like "91", "91%", "91% Full".
      */
     static Integer parseBatteryPercent(String raw) {
-        if (raw == null) {
+        if (!looksLikeValidSgdScalar(raw)) {
             return null;
         }
         String s = raw.trim();
-        if (s.endsWith("%")) {
-            s = s.substring(0, s.length() - 1).trim();
+        int start = -1;
+        int end = s.length();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= '0' && c <= '9') {
+                if (start < 0) {
+                    start = i;
+                }
+            } else if (start >= 0) {
+                end = i;
+                break;
+            }
         }
-        if (s.isEmpty()) {
+        if (start < 0) {
             return null;
         }
         try {
-            int n = Integer.parseInt(s);
+            int n = Integer.parseInt(s.substring(start, end));
             if (n < 0 || n > 100) {
                 return null;
             }
@@ -592,6 +631,10 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     }
 
     public void checkPrinterStatus(final MethodChannel.Result result) {
+        checkPrinterStatus(result, false);
+    }
+
+    public void checkPrinterStatus(final MethodChannel.Result result, final boolean sgdOnly) {
         tempIsPrinterConnect = true;
         if (printerConnection != null && printerConnection.isConnected()) {
             new Thread(new Runnable() {
@@ -619,47 +662,51 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
                     arguments.put("printMode", 0);
                     arguments.put("labelsRemainingInBatch", 0);
 
-                    try {
-                        ZebraPrinter printer = ZebraPrinterFactory.getInstance(printerConnection);
-                        PrinterStatus printerStatus = printer.getCurrentStatus();
-                        MyPrinterStatus myPrinterStatus = new MyPrinterStatus(
-                                printerStatus.isReadyToPrint,
-                                printerStatus.isHeadOpen,
-                                printerStatus.isHeadCold,
-                                printerStatus.isHeadTooHot,
-                                printerStatus.isPaperOut,
-                                printerStatus.isRibbonOut,
-                                printerStatus.isReceiveBufferFull,
-                                printerStatus.isPaused,
-                                printerStatus.labelLengthInDots,
-                                printerStatus.numberOfFormatsInReceiveBuffer,
-                                printerStatus.labelsRemainingInBatch,
-                                printerStatus.isPartialFormatInProgress,
-                                printerStatus.printMode.ordinal());
-                        arguments.put("isHeadCold", myPrinterStatus.isHeadCold);
-                        arguments.put("isReadyToPrint", myPrinterStatus.isReadyToPrint);
-                        arguments.put("isHeadOpen", myPrinterStatus.isHeadOpen);
-                        arguments.put("isPaperOut", myPrinterStatus.isPaperOut);
-                        arguments.put("isHeadTooHot", myPrinterStatus.isHeadTooHot);
-                        arguments.put("isPartialFormatInProgress", myPrinterStatus.isPartialFormatInProgress);
-                        arguments.put("isPaused", myPrinterStatus.isPaused);
-                        arguments.put("isReceiveBufferFull", myPrinterStatus.isReceiveBufferFull);
-                        arguments.put("isRibbonOut", myPrinterStatus.isRibbonOut);
-                        arguments.put("labelLengthInDots", myPrinterStatus.labelLengthInDots);
-                        arguments.put("numberOfFormatsInReceiveBuffer", myPrinterStatus.numberOfFormatsInReceiveBuffer);
-                        arguments.put("printMode", myPrinterStatus.printMode);
-                        arguments.put("labelsRemainingInBatch", myPrinterStatus.labelsRemainingInBatch);
-                    } catch (Exception e) {
-                        // Malformed status / language unknown — still read SGD battery below.
-                        android.util.Log.w("BatterySgd",
-                                "getCurrentStatus failed: " + e.getMessage() + " — reading SGD battery anyway");
+                    // Periodic battery polls skip getCurrentStatus — it is slow and often malformed.
+                    if (!sgdOnly) {
+                        try {
+                            ZebraPrinter printer = ZebraPrinterFactory.getInstance(printerConnection);
+                            PrinterStatus printerStatus = printer.getCurrentStatus();
+                            MyPrinterStatus myPrinterStatus = new MyPrinterStatus(
+                                    printerStatus.isReadyToPrint,
+                                    printerStatus.isHeadOpen,
+                                    printerStatus.isHeadCold,
+                                    printerStatus.isHeadTooHot,
+                                    printerStatus.isPaperOut,
+                                    printerStatus.isRibbonOut,
+                                    printerStatus.isReceiveBufferFull,
+                                    printerStatus.isPaused,
+                                    printerStatus.labelLengthInDots,
+                                    printerStatus.numberOfFormatsInReceiveBuffer,
+                                    printerStatus.labelsRemainingInBatch,
+                                    printerStatus.isPartialFormatInProgress,
+                                    printerStatus.printMode.ordinal());
+                            arguments.put("isHeadCold", myPrinterStatus.isHeadCold);
+                            arguments.put("isReadyToPrint", myPrinterStatus.isReadyToPrint);
+                            arguments.put("isHeadOpen", myPrinterStatus.isHeadOpen);
+                            arguments.put("isPaperOut", myPrinterStatus.isPaperOut);
+                            arguments.put("isHeadTooHot", myPrinterStatus.isHeadTooHot);
+                            arguments.put("isPartialFormatInProgress", myPrinterStatus.isPartialFormatInProgress);
+                            arguments.put("isPaused", myPrinterStatus.isPaused);
+                            arguments.put("isReceiveBufferFull", myPrinterStatus.isReceiveBufferFull);
+                            arguments.put("isRibbonOut", myPrinterStatus.isRibbonOut);
+                            arguments.put("labelLengthInDots", myPrinterStatus.labelLengthInDots);
+                            arguments.put("numberOfFormatsInReceiveBuffer", myPrinterStatus.numberOfFormatsInReceiveBuffer);
+                            arguments.put("printMode", myPrinterStatus.printMode);
+                            arguments.put("labelsRemainingInBatch", myPrinterStatus.labelsRemainingInBatch);
+                        } catch (Exception e) {
+                            // Malformed status / language unknown — still read SGD battery below.
+                            android.util.Log.w("BatterySgd",
+                                    "getCurrentStatus failed: " + e.getMessage() + " — reading SGD battery anyway");
+                        }
                     }
 
                     Integer batteryPercent = readBatteryPercent(printerConnection);
                     if (batteryPercent != null) {
                         arguments.put("batteryPercent", batteryPercent);
                     }
-                    android.util.Log.d("BatterySgd", "checkPrinterStatus batteryPercent=" + batteryPercent);
+                    android.util.Log.d("BatterySgd", "checkPrinterStatus sgdOnly=" + sgdOnly
+                            + " batteryPercent=" + batteryPercent);
 
                     JsonAdapter<Map> adapter = moshi.adapter(Map.class);
                     result.success(adapter.toJson(arguments));

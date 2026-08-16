@@ -1,6 +1,6 @@
 name: artemis_zebra_plus
 description: A new Flutter plugin working with zebra printers based on artemis_zebra
-version: 0.0.12
+version: 0.0.14
 homepage: https://github.com/MahmoodBakhshayesh/artemis_zebra_plus
 
 environment:

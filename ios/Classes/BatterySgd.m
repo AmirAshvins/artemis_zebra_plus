@@ -22,65 +22,141 @@
     return NO;
 }
 
-/// Parses a 0–100 integer from an SGD percent string (optional trailing %).
-+ (NSNumber *)_parsePercentString:(NSString *)raw {
+/// Rejects leftover ~HS / status blobs that SGD.GET sometimes returns after getCurrentStatus.
++ (BOOL)_looksLikeValidSgdScalar:(NSString *)raw {
     if (raw == nil) {
+        return NO;
+    }
+    NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0 || trimmed.length > 64) {
+        return NO;
+    }
+    // Host-status style payloads use STX/ETX (^B/^C) framing.
+    if ([trimmed rangeOfString:@"^B"].location != NSNotFound ||
+        [trimmed rangeOfString:@"^C"].location != NSNotFound ||
+        [trimmed rangeOfString:@"\x02"].location != NSNotFound ||
+        [trimmed rangeOfString:@"\x03"].location != NSNotFound) {
+        return NO;
+    }
+    // Multi-line blobs are never valid power.* scalars.
+    if ([trimmed rangeOfString:@"\n"].location != NSNotFound) {
+        return NO;
+    }
+    return YES;
+}
+
+/// Parses a leading 0–100 integer from SGD strings like "91", "91%", "91% Full".
++ (NSNumber *)_parsePercentString:(NSString *)raw {
+    if (![self _looksLikeValidSgdScalar:raw]) {
+        NSLog(@"[BatterySgd] reject scalar raw='%@'", raw);
         return nil;
     }
     NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if ([trimmed hasSuffix:@"%"]) {
-        trimmed = [[trimmed substringToIndex:trimmed.length - 1]
-                   stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // Take the first contiguous digit run (handles "91% Full", "100 %", etc.).
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+    NSUInteger start = NSNotFound;
+    NSUInteger end = trimmed.length;
+    for (NSUInteger i = 0; i < trimmed.length; i++) {
+        unichar c = [trimmed characterAtIndex:i];
+        if ([digits characterIsMember:c]) {
+            if (start == NSNotFound) {
+                start = i;
+            }
+        } else if (start != NSNotFound) {
+            end = i;
+            break;
+        }
     }
-    if (trimmed.length == 0) {
+    if (start == NSNotFound) {
         return nil;
     }
-    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-    if ([trimmed rangeOfCharacterFromSet:nonDigits].location != NSNotFound) {
-        return nil;
-    }
-    NSInteger n = [trimmed integerValue];
+    NSString *numStr = [trimmed substringWithRange:NSMakeRange(start, end - start)];
+    NSInteger n = [numStr integerValue];
     if (n < 0 || n > 100) {
         return nil;
     }
     return @(n);
 }
 
+/// Best-effort single drain. Do NOT loop — connection read: can block for maxTimeoutForRead.
++ (void)_drainConnectionOnce:(id<ZebraPrinterConnection, NSObject>)connection {
+    @try {
+        BOOL available = [connection hasBytesAvailable];
+        NSLog(@"[BatterySgd] drain check hasBytesAvailable=%@", available ? @"YES" : @"NO");
+        if (!available) {
+            return;
+        }
+        NSError *readError = nil;
+        NSData *data = [connection read:&readError];
+        NSLog(@"[BatterySgd] drained bytes=%lu error=%@",
+              (unsigned long)(data.length),
+              readError.localizedDescription ?: @"nil");
+    } @catch (NSException *exception) {
+        NSLog(@"[BatterySgd] drain exception: %@", exception);
+    }
+}
+
+/// Short-timeout SGD GET so a stuck radio cannot hang the Dart poll loop.
++ (NSString *)_getVar:(NSString *)key
+       connection:(id<ZebraPrinterConnection, NSObject>)connection
+            error:(NSError **)error {
+    // 2s first byte, 200ms quiet — enough for BT SGD, short enough to recover.
+    return [SGD GET:key
+withPrinterConnection:connection
+withMaxTimeoutForRead:2000
+andWithTimeToWaitForMoreData:200
+                error:error];
+}
+
+/// Tries Link-OS charge SGD keys in preference order; returns first parseable value.
++ (NSNumber *)_readChargePercent:(id<ZebraPrinterConnection, NSObject>)connection {
+    NSArray<NSString *> *keys = @[
+        @"power.percent_full",
+        @"power.relative_state_of_charge",
+        @"power.percent",
+        @"power.percentage",
+    ];
+    for (NSString *key in keys) {
+        NSError *error = nil;
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        NSString *raw = [self _getVar:key connection:connection error:&error];
+        NSLog(@"[BatterySgd] %@ raw='%@' error='%@' ms=%.0f",
+              key,
+              raw,
+              error.localizedDescription ?: @"nil",
+              (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+        NSNumber *parsed = [self _parsePercentString:raw];
+        if (parsed != nil) {
+            return parsed;
+        }
+    }
+    return nil;
+}
+
 + (NSNumber *)batteryPercentFromConnection:(id<ZebraPrinterConnection, NSObject>)connection {
     @try {
+        NSLog(@"[BatterySgd] begin connected=%@",
+              [connection isConnected] ? @"YES" : @"NO");
+        [self _drainConnectionOnce:connection];
+
         NSError *sourceError = nil;
-        NSString *sourceRaw = [SGD GET:@"power.source" withPrinterConnection:connection error:&sourceError];
-        if (sourceError != nil) {
-            NSLog(@"[BatterySgd] power.source error: %@", sourceError.localizedDescription);
-        }
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        NSString *sourceRaw = [self _getVar:@"power.source" connection:connection error:&sourceError];
         NSString *source = [[sourceRaw uppercaseString]
             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        NSLog(@"[BatterySgd] power.source raw='%@' normalized='%@'", sourceRaw, source);
+        NSLog(@"[BatterySgd] power.source raw='%@' normalized='%@' error='%@' ms=%.0f",
+              sourceRaw,
+              source,
+              sourceError.localizedDescription ?: @"nil",
+              (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
 
-        if ([self _isAcPowerSource:source]) {
+        // Missing / garbage source must not block charge reads — only skip on clear AC/line/mains.
+        if ([self _looksLikeValidSgdScalar:sourceRaw] && [self _isAcPowerSource:source]) {
             NSLog(@"[BatterySgd] skipping percent — AC/line/mains source '%@'", source);
             return nil;
         }
 
-        NSError *percentError = nil;
-        NSString *raw = [SGD GET:@"power.percent" withPrinterConnection:connection error:&percentError];
-        if (percentError != nil) {
-            NSLog(@"[BatterySgd] power.percent error: %@", percentError.localizedDescription);
-        }
-        NSLog(@"[BatterySgd] power.percent raw='%@'", raw);
-
-        NSNumber *parsed = [self _parsePercentString:raw];
-        // Older firmware sometimes exposes power.percentage instead.
-        if (parsed == nil) {
-            NSError *altError = nil;
-            NSString *altRaw = [SGD GET:@"power.percentage" withPrinterConnection:connection error:&altError];
-            if (altError != nil) {
-                NSLog(@"[BatterySgd] power.percentage error: %@", altError.localizedDescription);
-            }
-            NSLog(@"[BatterySgd] power.percentage raw='%@'", altRaw);
-            parsed = [self _parsePercentString:altRaw];
-        }
-
+        NSNumber *parsed = [self _readChargePercent:connection];
         NSLog(@"[BatterySgd] parsed batteryPercent=%@", parsed);
         return parsed;
     } @catch (NSException *exception) {
