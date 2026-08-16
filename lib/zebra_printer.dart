@@ -18,6 +18,9 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   /// When true, the next native [connectionLost] is expected (user/app disconnect).
   bool _intentionalDisconnect = false;
 
+  /// Bumps on every connect attempt so stale [connectionLost] cannot wipe a new session.
+  int _sessionEpoch = 0;
+
   /// Serializes [printData] so shared BP+BT sessions do not interleave ZPL.
   Future<void> _printQueue = Future<void>.value();
 
@@ -77,23 +80,29 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
 
   @override
   Future<bool> connectToPrinter(String address) async {
+    final int epoch = ++_sessionEpoch;
     status = PrinterStatus.connecting;
     notifier(this);
-    log('Zebra connect begin [$instanceID] address=$address');
+    log('Zebra connect begin [$instanceID] address=$address epoch=$epoch');
     final bool result = await channel.invokeMethod("connectToPrinter", {"address": address});
+    // A newer connect/disconnect superseded this attempt.
+    if (epoch != _sessionEpoch) {
+      log('Zebra connect STALE [$instanceID] epoch=$epoch now=$_sessionEpoch result=$result — ignoring');
+      return false;
+    }
     if (result) {
       print("result is true");
       status = PrinterStatus.ready;
-      log("Zebra Instance $instanceID Connected to $address (status=$status, listener=${broadcaster != null})");
+      log("Zebra Instance $instanceID Connected to $address (status=$status, epoch=$epoch, listener=${broadcaster != null})");
       notifier(this);
       // Fire-and-forget: do not block connect UI on SGD/status round-trip.
-      log('Zebra post-connect poll scheduled [$instanceID]');
+      log('Zebra post-connect poll scheduled [$instanceID] epoch=$epoch');
       unawaited(_pollPrinterStatusOnce(broadcaster, reason: 'post-connect'));
       return result;
     } else {
       print("result is false");
       status = PrinterStatus.disconnected;
-      log('Zebra connect FAILED [$instanceID] address=$address');
+      log('Zebra connect FAILED [$instanceID] address=$address epoch=$epoch');
       notifier(this);
       return result;
     }
@@ -129,19 +138,31 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
 
   @override
   Future<bool> disconnectPrinter() async {
+    // Already down — skip native close so we do not queue a late connectionLost
+    // that would wipe a subsequent connectToPrinter.
+    if (status == PrinterStatus.disconnected || status == PrinterStatus.disconnecting) {
+      log('Zebra disconnect SKIP [$instanceID] already status=$status');
+      return true;
+    }
     _intentionalDisconnect = true;
+    final int epochAtDisconnect = _sessionEpoch;
     status = PrinterStatus.disconnecting;
-    log('Zebra disconnect begin [$instanceID] intentional=true');
+    log('Zebra disconnect begin [$instanceID] intentional=true epoch=$epochAtDisconnect');
     notifier(this);
     try {
       final bool result = await channel.invokeMethod("disconnectPrinter");
-      status = PrinterStatus.disconnected;
-      notifier(this);
-      log('Zebra disconnect end [$instanceID] result=$result');
+      // Only mark disconnected if no newer connect started meanwhile.
+      if (epochAtDisconnect == _sessionEpoch) {
+        status = PrinterStatus.disconnected;
+        notifier(this);
+      } else {
+        log('Zebra disconnect end STALE [$instanceID] epoch=$epochAtDisconnect now=$_sessionEpoch — not wiping newer session');
+      }
+      log('Zebra disconnect end [$instanceID] result=$result statusNow=$status');
       return result;
     } finally {
       // Native may also emit connectionLost; keep flag briefly for that handler.
-      Future<void>.delayed(const Duration(milliseconds: 500), () {
+      Future<void>.delayed(const Duration(milliseconds: 800), () {
         _intentionalDisconnect = false;
       });
     }
@@ -181,17 +202,33 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       log("discoveryError : $error");
     } else if (methodCall.method == "connectionLost") {
       final prev = status;
+      if (_intentionalDisconnect) {
+        _intentionalDisconnect = false;
+        // Intentional close raced with a new connect — do not wipe ready/connecting.
+        if (prev == PrinterStatus.connecting || prev == PrinterStatus.ready || prev == PrinterStatus.printing) {
+          log('printerDisconnected (intentional STALE ignored) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch');
+          return null;
+        }
+        status = PrinterStatus.disconnected;
+        notifier(this);
+        final zStatus = ZebraPrinterStatus.disconnected();
+        zebraPrinterStatus = zStatus;
+        broadcaster?.call(zStatus);
+        log("printerDisconnected (intentional) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch");
+        return null;
+      }
+      // Unexpected drop — still ignore if a newer connect is already in flight/ready
+      // only when we just started connecting after this lost (epoch handles disconnect→connect).
+      if (prev == PrinterStatus.connecting) {
+        log('printerDisconnected (connectionLost during connecting — keeping connecting) [$instanceID]');
+        return null;
+      }
       status = PrinterStatus.disconnected;
       notifier(this);
       final zStatus = ZebraPrinterStatus.disconnected();
       zebraPrinterStatus = zStatus;
       broadcaster?.call(zStatus);
-      if (_intentionalDisconnect) {
-        log("printerDisconnected (intentional) [$instanceID] prevStatus=$prev");
-        _intentionalDisconnect = false;
-      } else {
-        log("printerDisconnected (connectionLost) [$instanceID] prevStatus=$prev");
-      }
+      log("printerDisconnected (connectionLost) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch");
     }
   }
 
