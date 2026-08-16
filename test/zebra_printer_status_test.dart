@@ -63,4 +63,12 @@ void main() {
     final again = ZebraPrinterStatus.fromJson(original.toJson());
     expect(again.batteryPercent, 35);
   });
+
+  test('fromJson coerces numeric printMode without dropping batteryPercent', () {
+    final json = baseJson(batteryPercent: 88);
+    json['printMode'] = 2.0; // Swift/JSON number edge case
+    final status = ZebraPrinterStatus.fromJson(json);
+    expect(status.printMode, 2);
+    expect(status.batteryPercent, 88);
+  });
 }

@@ -530,11 +530,23 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     private Integer readBatteryPercent(Connection connection) {
         try {
             String source = SGD.GET("power.source", connection);
+            android.util.Log.d("BatterySgd", "power.source raw='" + source + "'");
             if (isAcPowerSource(source)) {
+                android.util.Log.d("BatterySgd", "skipping percent — AC/line/mains source '" + source + "'");
                 return null;
             }
-            return parseBatteryPercent(SGD.GET("power.percent", connection));
+            String percentRaw = SGD.GET("power.percent", connection);
+            android.util.Log.d("BatterySgd", "power.percent raw='" + percentRaw + "'");
+            Integer parsed = parseBatteryPercent(percentRaw);
+            if (parsed == null) {
+                String alt = SGD.GET("power.percentage", connection);
+                android.util.Log.d("BatterySgd", "power.percentage raw='" + alt + "'");
+                parsed = parseBatteryPercent(alt);
+            }
+            android.util.Log.d("BatterySgd", "parsed batteryPercent=" + parsed);
+            return parsed;
         } catch (Exception e) {
+            android.util.Log.w("BatterySgd", "readBatteryPercent failed", e);
             return null;
         }
     }
@@ -544,7 +556,14 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
             return false;
         }
         String src = source.trim().toUpperCase();
-        return src.contains("LINE") || src.contains("AC") || src.contains("MAINS");
+        if (src.isEmpty()) {
+            return false;
+        }
+        // Prefer exact / prefix matches — avoid bare contains("AC") false positives.
+        if (src.equals("AC") || src.equals("LINE") || src.equals("MAINS")) {
+            return true;
+        }
+        return src.startsWith("AC") || src.contains("LINE") || src.contains("MAINS");
     }
 
     /**
@@ -573,26 +592,50 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     }
 
     public void checkPrinterStatus(final MethodChannel.Result result) {
-//        result.success("Not Connected");
-//        return;
         tempIsPrinterConnect = true;
         if (printerConnection != null && printerConnection.isConnected()) {
             new Thread(new Runnable() {
                 public void run() {
-
                     try {
                         printerConnection.open();
+                    } catch (ConnectionException e) {
+                        result.success("Not Connected");
+                        return;
+                    }
+
+                    HashMap<String, Object> arguments = new HashMap<>();
+                    // Defaults when getCurrentStatus fails (malformed status blob).
+                    arguments.put("isHeadCold", false);
+                    arguments.put("isReadyToPrint", true);
+                    arguments.put("isHeadOpen", false);
+                    arguments.put("isPaperOut", false);
+                    arguments.put("isHeadTooHot", false);
+                    arguments.put("isPartialFormatInProgress", false);
+                    arguments.put("isPaused", false);
+                    arguments.put("isReceiveBufferFull", false);
+                    arguments.put("isRibbonOut", false);
+                    arguments.put("labelLengthInDots", 0);
+                    arguments.put("numberOfFormatsInReceiveBuffer", 0);
+                    arguments.put("printMode", 0);
+                    arguments.put("labelsRemainingInBatch", 0);
+
+                    try {
                         ZebraPrinter printer = ZebraPrinterFactory.getInstance(printerConnection);
-
                         PrinterStatus printerStatus = printer.getCurrentStatus();
-
-                        MyPrinterStatus myPrinterStatus = new MyPrinterStatus(printerStatus.isReadyToPrint, printerStatus.isHeadOpen, printerStatus.isHeadCold, printerStatus.isHeadTooHot, printerStatus.isPaperOut, printerStatus.isRibbonOut, printerStatus.isReceiveBufferFull, printerStatus.isPaused, printerStatus.labelLengthInDots, printerStatus.numberOfFormatsInReceiveBuffer, printerStatus.labelsRemainingInBatch, printerStatus.isPartialFormatInProgress, printerStatus.printMode.ordinal());
-
-//                        String jsonOutput = myPrinterStatus.toJson();
-
-
-
-                        HashMap<String, Object> arguments = new HashMap<>();
+                        MyPrinterStatus myPrinterStatus = new MyPrinterStatus(
+                                printerStatus.isReadyToPrint,
+                                printerStatus.isHeadOpen,
+                                printerStatus.isHeadCold,
+                                printerStatus.isHeadTooHot,
+                                printerStatus.isPaperOut,
+                                printerStatus.isRibbonOut,
+                                printerStatus.isReceiveBufferFull,
+                                printerStatus.isPaused,
+                                printerStatus.labelLengthInDots,
+                                printerStatus.numberOfFormatsInReceiveBuffer,
+                                printerStatus.labelsRemainingInBatch,
+                                printerStatus.isPartialFormatInProgress,
+                                printerStatus.printMode.ordinal());
                         arguments.put("isHeadCold", myPrinterStatus.isHeadCold);
                         arguments.put("isReadyToPrint", myPrinterStatus.isReadyToPrint);
                         arguments.put("isHeadOpen", myPrinterStatus.isHeadOpen);
@@ -606,50 +649,24 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
                         arguments.put("numberOfFormatsInReceiveBuffer", myPrinterStatus.numberOfFormatsInReceiveBuffer);
                         arguments.put("printMode", myPrinterStatus.printMode);
                         arguments.put("labelsRemainingInBatch", myPrinterStatus.labelsRemainingInBatch);
-                        // SGD is not part of getCurrentStatus(); omit the key when unknown so Dart stays null.
-                        Integer batteryPercent = readBatteryPercent(printerConnection);
-                        if (batteryPercent != null) {
-                            arguments.put("batteryPercent", batteryPercent);
-                        }
-
-                        JsonAdapter<Map> adapter = moshi.adapter(Map.class);
-                        result.success(adapter.toJson(arguments));
-
-
-//                            if (jsonOutput != null) {
-//                                System.out.println("JSON Output: " + jsonOutput);
-//                            } else {
-//                                System.out.println("Failed to convert to JSON.");
-//                            }
-
-
-//                        result.success(jsonOutput);
-                        if (printerStatus.isReadyToPrint) {
-                            System.out.println("Ready To Print");
-                        } else if (printerStatus.isPaused) {
-                            System.out.println("Cannot Print because the printer is paused.");
-                        } else if (printerStatus.isHeadOpen) {
-                            System.out.println("Cannot Print because the printer head is open.");
-                        } else if (printerStatus.isPaperOut) {
-                            System.out.println("Cannot Print because the paper is out.");
-                        } else {
-                            System.out.println("Cannot Print.");
-                        }
-                    } catch (ConnectionException e) {
-                        result.success("Not Connected");
-//                            e.printStackTrace();
-//                            result.error(e.toString(),e.toString(),e);
-                    } catch (ZebraPrinterLanguageUnknownException e) {
-                        result.success("Not Connected");
-//                            e.printStackTrace();
-//                            result.error(e.toString(),e.toString(),e);
-                    } finally {
+                    } catch (Exception e) {
+                        // Malformed status / language unknown — still read SGD battery below.
+                        android.util.Log.w("BatterySgd",
+                                "getCurrentStatus failed: " + e.getMessage() + " — reading SGD battery anyway");
                     }
+
+                    Integer batteryPercent = readBatteryPercent(printerConnection);
+                    if (batteryPercent != null) {
+                        arguments.put("batteryPercent", batteryPercent);
+                    }
+                    android.util.Log.d("BatterySgd", "checkPrinterStatus batteryPercent=" + batteryPercent);
+
+                    JsonAdapter<Map> adapter = moshi.adapter(Map.class);
+                    result.success(adapter.toJson(arguments));
                 }
             }).start();
         } else {
             result.success("Not Connected");
-//                result.error("Not Connected","not connected",null);
         }
     }
 

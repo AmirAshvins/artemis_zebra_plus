@@ -66,6 +66,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       status = PrinterStatus.ready;
       log("Zebra Instance $instanceID Connected to $address");
       notifier(this);
+      // Don't wait for the next 5s poll — push SGD battery/status immediately.
+      await _pollPrinterStatusOnce(broadcaster);
       return result;
     } else {
       print("result is false");
@@ -142,6 +144,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       status = PrinterStatus.disconnected;
       notifier(this);
       final zStatus = ZebraPrinterStatus.disconnected();
+      zebraPrinterStatus = zStatus;
       broadcaster?.call(zStatus);
       log("printerDisconnected");
     }
@@ -207,21 +210,30 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     return await channel.invokeMethod("sampleWithGCD");
   }
 
-  void broadCastStatus(Function? listener) {
-    channel.invokeMethod('checkPrinterStatus').then((v){
-      // print(v);
-      try{
-        final status = ZebraPrinterStatus.fromJson(jsonDecode(v));
-        listener?.call(status);
-        Future.delayed(const Duration(seconds: 5),(){
-          broadCastStatus(listener);
-        });
-      }catch(e){
-        // print(e);
-        Future.delayed(const Duration(seconds: 5),(){
-          broadCastStatus(listener);
-        });
+  /// One status/SGD poll: updates [zebraPrinterStatus], notifies [listener], and logs battery %.
+  Future<void> _pollPrinterStatusOnce(Function? listener) async {
+    try {
+      final dynamic raw = await channel.invokeMethod('checkPrinterStatus');
+      final String rawText = raw?.toString() ?? 'null';
+      try {
+        final parsed = ZebraPrinterStatus.fromJson(jsonDecode(rawText) as Map<String, dynamic>);
+        zebraPrinterStatus = parsed;
+        listener?.call(parsed);
+        log('Zebra battery poll [$instanceID]: batteryPercent=${parsed.batteryPercent}');
+      } catch (e) {
+        log('Zebra battery poll [$instanceID]: parse/status failed raw="$rawText" error=$e');
       }
+    } catch (e) {
+      log('Zebra battery poll [$instanceID]: channel failed error=$e');
+    }
+  }
+
+  /// Polls printer status (incl. SGD battery) every 5s and fans out to [listener].
+  void broadCastStatus(Function? listener) {
+    _pollPrinterStatusOnce(listener).whenComplete(() {
+      Future.delayed(const Duration(seconds: 5), () {
+        broadCastStatus(listener);
+      });
     });
   }
 }

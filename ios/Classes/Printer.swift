@@ -276,59 +276,101 @@ class Printer{
             return
         }
         if let zebraPrinterConnection = self.connection as? TcpPrinterConnection {
-            // obj is a string array. Do something with stringArray
-
-        
-
-        // Open the connection - physical connection is established here.
-//        let success = zebraPrinterConnection.open()
-        
-        do {
-            // Get printer instance from connection.
-            let printer = try ZebraPrinterFactory.getInstance(zebraPrinterConnection)
-            
-            // Get the current status of the printer.
-            let printerStatus = try printer.getCurrentStatus()
-            let status = MyPrinterStatus(isReadyToPrint: printerStatus.isReadyToPrint, isHeadOpen: printerStatus.isHeadOpen, isHeadCold: printerStatus.isHeadCold, isHeadTooHot: printerStatus.isHeadTooHot, isPaperOut: printerStatus.isPaperOut, isRibbonOut: printerStatus.isRibbonOut, isReceiveBufferFull: printerStatus.isReceiveBufferFull, isPaused: printerStatus.isPaused, labelLengthInDots: printerStatus.labelLengthInDots, numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer, labelsRemainingInBatch: printerStatus.labelsRemainingInBatch, isPartialFormatInProgress: printerStatus.isPartialFormatInProgress, printMode: printerStatus.printMode.rawValue)
-            status.batteryPercent = BatterySgd.batteryPercent(fromConnection: zebraPrinterConnection)?.intValue
-            
-            let jsonEncoder = JSONEncoder()
-            let jsonData = try! jsonEncoder.encode(status)
-            let json = String(data: jsonData, encoding: String.Encoding.utf8)
-            
-            result(json)
-        } catch {
-            // Handle any errors thrown by the printer operations.
-            result(error.localizedDescription)
-//            showAlert(title: "Error", message: error.localizedDescription)
-        }
-        
-        }else if let zebraPrinterConnection = self.connection as? MfiBtPrinterConnection {
-            do {
-                // Get printer instance from connection.
-                let printer = try ZebraPrinterFactory.getInstance(zebraPrinterConnection)
-                
-                // Get the current status of the printer.
-                let printerStatus = try printer.getCurrentStatus()
-                let status = MyPrinterStatus(isReadyToPrint: printerStatus.isReadyToPrint, isHeadOpen: printerStatus.isHeadOpen, isHeadCold: printerStatus.isHeadCold, isHeadTooHot: printerStatus.isHeadTooHot, isPaperOut: printerStatus.isPaperOut, isRibbonOut: printerStatus.isRibbonOut, isReceiveBufferFull: printerStatus.isReceiveBufferFull, isPaused: printerStatus.isPaused, labelLengthInDots: printerStatus.labelLengthInDots, numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer, labelsRemainingInBatch: printerStatus.labelsRemainingInBatch, isPartialFormatInProgress: printerStatus.isPartialFormatInProgress, printMode: printerStatus.printMode.rawValue)
-                status.batteryPercent = BatterySgd.batteryPercent(fromConnection: zebraPrinterConnection)?.intValue
-                
-                let jsonEncoder = JSONEncoder()
-                let jsonData = try! jsonEncoder.encode(status)
-                let json = String(data: jsonData, encoding: String.Encoding.utf8)
-                
-                result(json)
-            } catch {
-                // Handle any errors thrown by the printer operations.
-                result(error.localizedDescription)
-    //            showAlert(title: "Error", message: error.localizedDescription)
+            if !zebraPrinterConnection.isConnected() {
+                _ = zebraPrinterConnection.open()
             }
+            result(self.statusJson(tcp: zebraPrinterConnection, transport: "TCP"))
+        } else if let zebraPrinterConnection = self.connection as? MfiBtPrinterConnection {
+            if !zebraPrinterConnection.isConnected() {
+                _ = zebraPrinterConnection.open()
+            }
+            result(self.statusJson(bt: zebraPrinterConnection, transport: "BT"))
         }
         else {
             result("Not TCP")
             return
         }
         }
+    }
+
+    /// TCP overload — concrete type satisfies both factory and BatterySgd/SGD NSObject typing.
+    private func statusJson(tcp connection: TcpPrinterConnection, transport: String) -> String {
+        return buildStatusJson(
+            transport: transport,
+            loadPrinterStatus: {
+                let printer = try ZebraPrinterFactory.getInstance(connection)
+                return try printer.getCurrentStatus()
+            },
+            readBattery: {
+                BatterySgd.batteryPercent(fromConnection: connection)?.intValue
+            }
+        )
+    }
+
+    /// MFi BT overload — concrete type satisfies both factory and BatterySgd/SGD NSObject typing.
+    private func statusJson(bt connection: MfiBtPrinterConnection, transport: String) -> String {
+        return buildStatusJson(
+            transport: transport,
+            loadPrinterStatus: {
+                let printer = try ZebraPrinterFactory.getInstance(connection)
+                return try printer.getCurrentStatus()
+            },
+            readBattery: {
+                BatterySgd.batteryPercent(fromConnection: connection)?.intValue
+            }
+        )
+    }
+
+    /// Builds status JSON even when Link-OS `getCurrentStatus` fails (common
+    /// "Malformed status response"). SGD battery is independent of that API.
+    private func buildStatusJson(
+        transport: String,
+        loadPrinterStatus: () throws -> PrinterStatus,
+        readBattery: () -> Int?
+    ) -> String {
+        var status = MyPrinterStatus(
+            isReadyToPrint: true,
+            isHeadOpen: false,
+            isHeadCold: false,
+            isHeadTooHot: false,
+            isPaperOut: false,
+            isRibbonOut: false,
+            isReceiveBufferFull: false,
+            isPaused: false,
+            labelLengthInDots: 0,
+            numberOfFormatsInReceiveBuffer: 0,
+            labelsRemainingInBatch: 0,
+            isPartialFormatInProgress: false,
+            printMode: 0
+        )
+        do {
+            let printerStatus = try loadPrinterStatus()
+            status = MyPrinterStatus(
+                isReadyToPrint: printerStatus.isReadyToPrint,
+                isHeadOpen: printerStatus.isHeadOpen,
+                isHeadCold: printerStatus.isHeadCold,
+                isHeadTooHot: printerStatus.isHeadTooHot,
+                isPaperOut: printerStatus.isPaperOut,
+                isRibbonOut: printerStatus.isRibbonOut,
+                isReceiveBufferFull: printerStatus.isReceiveBufferFull,
+                isPaused: printerStatus.isPaused,
+                labelLengthInDots: printerStatus.labelLengthInDots,
+                numberOfFormatsInReceiveBuffer: printerStatus.numberOfFormatsInReceiveBuffer,
+                labelsRemainingInBatch: printerStatus.labelsRemainingInBatch,
+                isPartialFormatInProgress: printerStatus.isPartialFormatInProgress,
+                printMode: printerStatus.printMode.rawValue
+            )
+        } catch {
+            // ZEBRA_MALFORMED_PRINTER_STATUS_RESPONSE etc. — keep defaults and still read SGD.
+            NSLog("[Zebra checkPrinterStatus] %@ getCurrentStatus failed: %@ — reading SGD battery anyway",
+                  transport, error.localizedDescription)
+        }
+        status.batteryPercent = readBattery()
+        NSLog("[Zebra checkPrinterStatus] %@ batteryPercent=%@",
+              transport, status.batteryPercent.map { "\($0)" } ?? "nil")
+        let jsonEncoder = JSONEncoder()
+        let jsonData = try! jsonEncoder.encode(status)
+        return String(data: jsonData, encoding: String.Encoding.utf8) ?? "{}"
     }
     
     func checkPrinterStatus2(result: @escaping FlutterResult) {

@@ -156,21 +156,29 @@ class ZebraPrinterStatus {
   }
 
   factory ZebraPrinterStatus.fromJson(Map<String, dynamic> json) => ZebraPrinterStatus(
-    isPaused: json["isPaused"],
-    numberOfFormatsInReceiveBuffer: json["numberOfFormatsInReceiveBuffer"]??0,
-    isReadyToPrint: json["isReadyToPrint"],
-    isPaperOut: json["isPaperOut"],
-    isPartialFormatInProgress: json["isPartialFormatInProgress"],
-    isReceiveBufferFull: json["isReceiveBufferFull"],
-    labelLengthInDots: json["labelLengthInDots"]??0,
-    isRibbonOut: json["isRibbonOut"],
-    isHeadTooHot: json["isHeadTooHot"],
-    labelsRemainingInBatch: json["labelsRemainingInBatch"],
-    isHeadOpen: json["isHeadOpen"],
-    isHeadCold: json["isHeadCold"],
-    printMode: json["printMode"],
+    isPaused: json["isPaused"] == true,
+    numberOfFormatsInReceiveBuffer: _asInt(json["numberOfFormatsInReceiveBuffer"]) ?? 0,
+    isReadyToPrint: json["isReadyToPrint"] == true,
+    isPaperOut: json["isPaperOut"] == true,
+    isPartialFormatInProgress: json["isPartialFormatInProgress"] == true,
+    isReceiveBufferFull: json["isReceiveBufferFull"] == true,
+    labelLengthInDots: _asInt(json["labelLengthInDots"]) ?? 0,
+    isRibbonOut: json["isRibbonOut"] == true,
+    isHeadTooHot: json["isHeadTooHot"] == true,
+    labelsRemainingInBatch: _asInt(json["labelsRemainingInBatch"]) ?? 0,
+    isHeadOpen: json["isHeadOpen"] == true,
+    isHeadCold: json["isHeadCold"] == true,
+    // Swift UInt32 / Android int must not blow the whole parse (and drop battery).
+    printMode: _asInt(json["printMode"]) ?? 0,
     batteryPercent: parseBatteryPercent(json["batteryPercent"]),
   );
+
+  static int? _asInt(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is num) return value.round();
+    return int.tryParse(value.toString());
+  }
 
   Map<String, dynamic> toJson() => {
     "isPaused": isPaused,
