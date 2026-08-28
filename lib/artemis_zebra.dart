@@ -1,10 +1,9 @@
 
-import 'dart:developer';
-
 import 'package:artemis_zebra_plus/artemis_zebra_plus_platform_interface.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'zebra_logging.dart';
 import 'zebra_printer.dart';
 
 class ArtemisZebraPlus {
@@ -32,18 +31,18 @@ class ArtemisZebraPlus {
       Permission.nearbyWifiDevices,
       // Permission.storage,
     ].request();
-    print("Persmissions: ${statuses[Permission.location]}");
+    zebraPackagePrint("Persmissions: ${statuses[Permission.location]}");
   }
 
   Future<dynamic> _methodCallHandler(MethodCall methodCall) async {
 
 
     if (methodCall.method == "printerFound") {
-      log("printerFound");
+      zebraPackageLog("printerFound");
       // String barcode = methodCall.arguments.toString();
 
     }else if(methodCall.method == "discoveryDone"){
-      log("discoveryDone");
+      zebraPackageLog("discoveryDone");
       String? ocrJson = await methodCall.arguments;
       if (ocrJson == null) return null;
       try {

@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'artemis_zebra_plus_platform_interface.dart';
+import 'zebra_logging.dart';
 import 'zebra_printer.dart';
 
 /// An implementation of [ArtemisZebraPlusPlatform] that uses method channels.
@@ -37,7 +38,7 @@ class MethodChannelArtemisZebraPlus extends ArtemisZebraPlusPlatform {
     getPermissions();
     String id = await methodChannel.invokeMethod("getInstance");
     ZebraPrinter printer = ZebraPrinter(id, label: label, notifierFunction: notifier,statusListener: statusListener);
-    print("${printer.instanceID}");
+    zebraPackagePrint("${printer.instanceID}");
 
     return printer;
   }
