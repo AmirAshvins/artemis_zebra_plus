@@ -30,6 +30,11 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   /// True while a battery poll invokeMethod is in flight (detect overlapping hangs).
   bool _batteryPollInFlight = false;
 
+  /// When false, the 20s SGD timer is cancelled (disconnect / dispose / background).
+  bool _statusPollingEnabled = false;
+
+  Timer? _statusPollTimer;
+
   ZebraPrinter(String id, {String? label, required void Function(ZebraPrinter) notifierFunction,Function? statusListener}) {
     channel = MethodChannel('ZebraPrinterInstance$id');
     zebraPackageLog("ZebraPrinterInstanceCreated: $id  (${label ?? id})");
@@ -37,8 +42,6 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     notifier = notifierFunction;
     channel.setMethodCallHandler(_printerMethodCallHandler);
     broadcaster = statusListener;
-    zebraPackageLog('Zebra battery loop START [$instanceID] listener=${statusListener != null}');
-    broadCastStatus(statusListener);
   }
 
   PrinterStatus status = PrinterStatus.disconnected;
@@ -98,6 +101,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       // Fire-and-forget: do not block connect UI on SGD/status round-trip.
       zebraPackageLog('Zebra post-connect poll scheduled [$instanceID] epoch=$epoch');
       unawaited(_pollPrinterStatusOnce(broadcaster, reason: 'post-connect'));
+      startStatusPolling();
       return result;
     } else {
       zebraPackagePrint("result is false");
@@ -142,8 +146,10 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     // that would wipe a subsequent connectToPrinter.
     if (status == PrinterStatus.disconnected || status == PrinterStatus.disconnecting) {
       zebraPackageLog('Zebra disconnect SKIP [$instanceID] already status=$status');
+      stopStatusPolling();
       return true;
     }
+    stopStatusPolling();
     _intentionalDisconnect = true;
     final int epochAtDisconnect = _sessionEpoch;
     status = PrinterStatus.disconnecting;
@@ -215,6 +221,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
         zebraPrinterStatus = zStatus;
         broadcaster?.call(zStatus);
         zebraPackageLog("printerDisconnected (intentional) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch");
+        stopStatusPolling();
         return null;
       }
       // Unexpected drop — still ignore if a newer connect is already in flight/ready
@@ -229,6 +236,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       zebraPrinterStatus = zStatus;
       broadcaster?.call(zStatus);
       zebraPackageLog("printerDisconnected (connectionLost) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch");
+      stopStatusPolling();
     }
   }
 
@@ -335,13 +343,38 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     }
   }
 
-  /// Polls printer status (incl. SGD battery) every 5s and fans out to [listener].
-  void broadCastStatus(Function? listener) {
-    zebraPackageLog('Zebra battery loop TICK [$instanceID] status=$status inFlight=$_batteryPollInFlight');
-    _pollPrinterStatusOnce(listener, reason: 'loop').whenComplete(() {
-      Future.delayed(const Duration(seconds: 5), () {
-        broadCastStatus(listener);
-      });
+  /// Starts a 20s SGD battery poll. No-op when already running or disconnected.
+  void startStatusPolling() {
+    if (_statusPollingEnabled) return;
+    _statusPollingEnabled = true;
+    zebraPackageLog('Zebra battery loop START [$instanceID] listener=${broadcaster != null}');
+    _statusPollTimer?.cancel();
+    _statusPollTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (!_statusPollingEnabled) return;
+      unawaited(_pollPrinterStatusOnce(broadcaster, reason: 'loop'));
     });
+  }
+
+  /// Cancels the SGD poll timer (disconnect, dispose, or app background).
+  void stopStatusPolling() {
+    if (!_statusPollingEnabled && _statusPollTimer == null) return;
+    _statusPollingEnabled = false;
+    _statusPollTimer?.cancel();
+    _statusPollTimer = null;
+    zebraPackageLog('Zebra battery loop STOP [$instanceID]');
+  }
+
+  /// Releases the method channel and stops polling.
+  void dispose() {
+    stopStatusPolling();
+    channel.setMethodCallHandler(null);
+  }
+
+  /// Polls printer status (incl. SGD battery) every 20s and fans out to [listener].
+  ///
+  /// Kept for callers that still invoke the old loop; prefer [startStatusPolling].
+  void broadCastStatus(Function? listener) {
+    broadcaster = listener ?? broadcaster;
+    startStatusPolling();
   }
 }
