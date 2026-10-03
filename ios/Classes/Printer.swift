@@ -5,6 +5,7 @@
 //  Created by faranegar on 6/21/20.
 //
 import AVFoundation
+import ExternalAccessory
 import Foundation
 import Flutter
 
@@ -19,6 +20,12 @@ class Printer{
     var wifiManager: POSWIFIManager?
     var isConnecting :Bool = false
     var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+
+    /// Bumped on connect/disconnect so a late EA drop cannot kill the next session.
+    private var linkGeneration: Int = 0
+    private var unexpectedLossEmitted = false
+    private var disconnectObserver: NSObjectProtocol?
+    private let linkLock = NSLock()
 
     
     static func getInstance(binaryMessenger : FlutterBinaryMessenger) -> Printer {
@@ -148,6 +155,9 @@ class Printer{
             self.isConnecting = true
             self.isZebraPrinter = true
             selectedIPAddress = nil
+            // Previous socket's EA observer must not apply to this attempt.
+            self.beginLinkSession()
+            self.stopWatchingMfiDisconnect()
 
             // Close any existing connection before starting a new one
             if self.connection != nil {
@@ -180,6 +190,10 @@ class Printer{
                     if isOpen == true {
                         Thread.sleep(forTimeInterval: 1)
                         self.selectedIPAddress = address
+                        // MFi serials have no dot. TCP has no EAAccessory disconnect event.
+                        if !address.contains(".") {
+                            self.watchMfiDisconnect(serial: address)
+                        }
                         result(true)
                     } else {
                         result(false)
@@ -215,6 +229,10 @@ class Printer{
     
     
     func disconnect(result: FlutterResult?) {
+        // Own close also posts EAAccessoryDidDisconnect. Retire first so that
+        // notification is not a second unexpected loss.
+        self.beginLinkSession()
+        self.stopWatchingMfiDisconnect()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
@@ -273,8 +291,12 @@ class Printer{
     }
     
     func checkPrinterStatus(sgdOnly: Bool = false, result: @escaping FlutterResult) {
-        // Instantiate connection for TCP port at the given address.
-         DispatchQueue.global(qos: .utility).async {
+        // Capture the session before hopping queues. A connect that starts
+        // while this poll runs must not be closed by the poll's failure.
+        linkLock.lock()
+        let generation = linkGeneration
+        linkLock.unlock()
+        DispatchQueue.global(qos: .utility).async {
         let connDesc: String
         if self.connection == nil {
             connDesc = "nil"
@@ -290,18 +312,31 @@ class Printer{
 
         if(self.connection==nil){
             NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (nil) instance=%@", self.toString())
-            result("Not Connected")
+            if sgdOnly {
+                self.emitUnexpectedLinkLoss(generation: generation, result: result)
+            } else {
+                result("Not Connected")
+            }
             return
         }
         if let zebraPrinterConnection = self.connection as? TcpPrinterConnection {
-            // Battery polls must not reopen a dead socket — that fights the live shared session.
             if !zebraPrinterConnection.isConnected() {
                 if sgdOnly {
                     NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (TCP dead, sgdOnly) instance=%@", self.toString())
-                    result("Not Connected")
+                    self.emitUnexpectedLinkLoss(generation: generation, result: result)
                     return
                 }
                 _ = zebraPrinterConnection.open()
+            }
+            if sgdOnly {
+                if let json = self.sgdPollJson(zebraPrinterConnection) {
+                    NSLog("[Zebra checkPrinterStatus] EXIT TCP instance=%@ jsonLen=%ld", self.toString(), json.count)
+                    result(json)
+                } else {
+                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (TCP SGD) instance=%@", self.toString())
+                    self.emitUnexpectedLinkLoss(generation: generation, result: result)
+                }
+                return
             }
             let json = self.statusJson(tcp: zebraPrinterConnection, transport: "TCP", sgdOnly: sgdOnly)
             NSLog("[Zebra checkPrinterStatus] EXIT TCP instance=%@ jsonLen=%ld", self.toString(), json.count)
@@ -310,10 +345,20 @@ class Printer{
             if !zebraPrinterConnection.isConnected() {
                 if sgdOnly {
                     NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (BT dead, sgdOnly) instance=%@", self.toString())
-                    result("Not Connected")
+                    self.emitUnexpectedLinkLoss(generation: generation, result: result)
                     return
                 }
                 _ = zebraPrinterConnection.open()
+            }
+            if sgdOnly {
+                if let json = self.sgdPollJson(zebraPrinterConnection) {
+                    NSLog("[Zebra checkPrinterStatus] EXIT BT instance=%@ jsonLen=%ld", self.toString(), json.count)
+                    result(json)
+                } else {
+                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (BT SGD) instance=%@", self.toString())
+                    self.emitUnexpectedLinkLoss(generation: generation, result: result)
+                }
+                return
             }
             let json = self.statusJson(bt: zebraPrinterConnection, transport: "BT", sgdOnly: sgdOnly)
             NSLog("[Zebra checkPrinterStatus] EXIT BT instance=%@ jsonLen=%ld", self.toString(), json.count)
@@ -321,9 +366,123 @@ class Printer{
         }
         else {
             NSLog("[Zebra checkPrinterStatus] EXIT Not TCP instance=%@", self.toString())
-            result("Not TCP")
+            if sgdOnly {
+                self.emitUnexpectedLinkLoss(generation: generation, result: result)
+            } else {
+                result("Not TCP")
+            }
             return
         }
+        }
+    }
+
+    /// One SGD battery read for the ready-session poll.
+    ///
+    /// Returns nil when the transport fails (power-off / out of range) so the
+    /// caller can emit connectionLost instead of a fake ready JSON body.
+    /// A live AC printer returns JSON with a null battery.
+    private func sgdPollJson(_ connection: (ZebraPrinterConnection & NSObjectProtocol)) -> String? {
+        var linkFailed = ObjCBool(false)
+        let percent = BatterySgd.batteryPercent(fromConnection: connection, linkFailed: &linkFailed)
+        if linkFailed.boolValue || !connection.isConnected() {
+            return nil
+        }
+        let status = MyPrinterStatus(
+            isReadyToPrint: true,
+            isHeadOpen: false,
+            isHeadCold: false,
+            isHeadTooHot: false,
+            isPaperOut: false,
+            isRibbonOut: false,
+            isReceiveBufferFull: false,
+            isPaused: false,
+            labelLengthInDots: 0,
+            numberOfFormatsInReceiveBuffer: 0,
+            labelsRemainingInBatch: 0,
+            isPartialFormatInProgress: false,
+            printMode: 0,
+            batteryPercent: percent?.intValue
+        )
+        guard let data = try? JSONEncoder().encode(status),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return json
+    }
+
+    /// Starts a new link generation. In-flight polls from the previous socket
+    /// must not close this one.
+    private func beginLinkSession() {
+        linkLock.lock()
+        linkGeneration += 1
+        unexpectedLossEmitted = false
+        linkLock.unlock()
+    }
+
+    /// MFi power-off posts EAAccessoryDidDisconnect. TCP has no equivalent.
+    private func watchMfiDisconnect(serial: String) {
+        stopWatchingMfiDisconnect()
+        linkLock.lock()
+        let generation = linkGeneration
+        linkLock.unlock()
+        disconnectObserver = NotificationCenter.default.addObserver(
+            forName: .EAAccessoryDidDisconnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self else { return }
+            guard let accessory = note.userInfo?[EAAccessoryKey] as? EAAccessory else { return }
+            guard accessory.serialNumber == serial else { return }
+            NSLog("[Zebra] EAAccessory disconnected serial=%@", serial)
+            self.emitUnexpectedLinkLoss(generation: generation, result: nil)
+        }
+    }
+
+    private func stopWatchingMfiDisconnect() {
+        if let observer = disconnectObserver {
+            NotificationCenter.default.removeObserver(observer)
+            disconnectObserver = nil
+        }
+    }
+
+    /// Closes the socket that belonged to [generation] and tells Dart once.
+    /// A newer connect (higher generation) is left alone; [result] is still completed.
+    private func emitUnexpectedLinkLoss(generation: Int, result: FlutterResult?) {
+        linkLock.lock()
+        let stillCurrent = generation == linkGeneration
+        var shouldEmit = false
+        if stillCurrent && !unexpectedLossEmitted {
+            unexpectedLossEmitted = true
+            shouldEmit = true
+        }
+        let dying: ZebraPrinterConnection? = stillCurrent ? connection : nil
+        linkLock.unlock()
+        if stillCurrent {
+            stopWatchingMfiDisconnect()
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            // Only the socket captured for this generation. A newer connect
+            // already replaced `connection` and must stay open.
+            if stillCurrent {
+                dying?.close()
+            }
+            DispatchQueue.main.async {
+                guard let self = self else {
+                    result?("Not Connected")
+                    return
+                }
+                self.linkLock.lock()
+                // A connect bumps the generation before it installs a new socket.
+                let stillThisSession = self.linkGeneration == generation
+                if stillThisSession {
+                    self.connection = nil
+                }
+                self.linkLock.unlock()
+                if shouldEmit && stillThisSession {
+                    self.channel?.invokeMethod("connectionLost", arguments: nil)
+                }
+                result?("Not Connected")
+            }
         }
     }
 

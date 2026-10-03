@@ -7,8 +7,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -78,6 +81,14 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     private static int countEndScan = 0;
     private boolean isZebraPrinter = true;
     private Socketmanager socketmanager;
+
+    // Guards linkGeneration so a late ACL or poll cannot kill the next session.
+    private final Object linkLock = new Object();
+    private int linkGeneration = 0;
+    private boolean unexpectedLossEmitted = false;
+    private BroadcastReceiver aclDisconnectReceiver;
+    private boolean aclReceiverRegistered = false;
+    private int registeredAclGeneration = -1;
 
     public Printer() {
         // Default constructor is required for the Android service to work correctly
@@ -275,6 +286,12 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     }
 
     public void connectToPrinter(final String address, final MethodChannel.Result result) {
+        // Drop the previous socket's listener before opening a new one.
+        retireCurrentLink();
+        final int generation;
+        synchronized (linkLock) {
+            generation = linkGeneration;
+        }
         if (address.contains(":")) {
             printerConnection = new BluetoothConnection(address);
         } else {
@@ -299,6 +316,13 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
                     try {
                         printer = ZebraPrinterFactory.getInstance(printerConnection);
                         startService(address);
+                        if (printerConnection instanceof BluetoothConnection) {
+                            String mac = ((BluetoothConnection) printerConnection).getMACAddress();
+                            if (mac == null || mac.isEmpty()) {
+                                mac = address;
+                            }
+                            registerAclDisconnectListener(mac, generation);
+                        }
                         try {
                             result.success(true);
                         } catch (Exception e) {
@@ -368,6 +392,8 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
     }
 
     public void disconnectPrinter(final MethodChannel.Result result) {
+        // Bump the generation before close so this socket's ACL drop is not a second loss event.
+        retireCurrentLink();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -528,7 +554,7 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
      * printer is AC-powered, SGD is missing, or the value cannot be parsed.
      * Never uses 0 as a stand-in for "unknown".
      */
-    private Integer readBatteryPercent(Connection connection) {
+    private Integer readBatteryPercent(Connection connection) throws ConnectionException {
         try {
             String source = SGD.GET("power.source", connection);
             android.util.Log.d("BatterySgd", "power.source raw='" + source + "'");
@@ -554,6 +580,10 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
             }
             android.util.Log.d("BatterySgd", "parsed batteryPercent=" + parsed);
             return parsed;
+        } catch (ConnectionException e) {
+            // Power-off and out-of-range throw here. isConnected() stays true until close().
+            android.util.Log.w("BatterySgd", "readBatteryPercent link failed", e);
+            throw e;
         } catch (Exception e) {
             android.util.Log.w("BatterySgd", "readBatteryPercent failed", e);
             return null;
@@ -630,91 +660,252 @@ public class Printer extends Service implements MethodChannel.MethodCallHandler 
         }
     }
 
+    /**
+     * Invalidates the current link so a late ACL broadcast or poll from this
+     * socket cannot mark a newer session disconnected.
+     */
+    private void retireCurrentLink() {
+        synchronized (linkLock) {
+            linkGeneration++;
+            unexpectedLossEmitted = false;
+        }
+        unregisterAclDisconnectListener();
+    }
+
+    /**
+     * BluetoothSocket.isConnected() stays true after the printer powers off
+     * until close(). ACL_DISCONNECTED is the OS signal for that drop.
+     */
+    private void registerAclDisconnectListener(final String mac, final int generation) {
+        if (context == null || mac == null || mac.isEmpty()) {
+            return;
+        }
+        unregisterAclDisconnectListener();
+        aclDisconnectReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                if (intent == null || !BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(intent.getAction())) {
+                    return;
+                }
+                final Connection dying;
+                synchronized (linkLock) {
+                    if (generation != linkGeneration) {
+                        return;
+                    }
+                    dying = printerConnection;
+                }
+                BluetoothDevice device;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                } else {
+                    device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                }
+                if (device == null || device.getAddress() == null) {
+                    return;
+                }
+                if (!mac.equalsIgnoreCase(device.getAddress())) {
+                    return;
+                }
+                android.util.Log.d("BatterySgd", "ACL disconnected mac=" + device.getAddress());
+                reportUnexpectedLinkLoss(null, dying, generation);
+            }
+        };
+        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        Context appContext = context.getApplicationContext();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(aclDisconnectReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            appContext.registerReceiver(aclDisconnectReceiver, filter);
+        }
+        aclReceiverRegistered = true;
+        registeredAclGeneration = generation;
+    }
+
+    private void unregisterAclDisconnectListener() {
+        if (!aclReceiverRegistered || aclDisconnectReceiver == null || context == null) {
+            aclReceiverRegistered = false;
+            aclDisconnectReceiver = null;
+            registeredAclGeneration = -1;
+            return;
+        }
+        try {
+            context.getApplicationContext().unregisterReceiver(aclDisconnectReceiver);
+        } catch (IllegalArgumentException ignored) {
+            // Already unregistered — safe when connect and disconnect overlap.
+        }
+        aclReceiverRegistered = false;
+        aclDisconnectReceiver = null;
+        registeredAclGeneration = -1;
+    }
+
+    /**
+     * Closes [dying] and tells Dart the link is gone, once per generation.
+     * Completes [result] with "Not Connected" even when a newer session owns the radio.
+     */
+    private void reportUnexpectedLinkLoss(
+            @Nullable final MethodChannel.Result result,
+            @Nullable final Connection dying,
+            final int generation
+    ) {
+        final boolean emit;
+        synchronized (linkLock) {
+            if (generation == linkGeneration && !unexpectedLossEmitted) {
+                unexpectedLossEmitted = true;
+                emit = true;
+            } else {
+                emit = false;
+            }
+        }
+        if (registeredAclGeneration == generation) {
+            unregisterAclDisconnectListener();
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (dying != null) {
+                        dying.close();
+                    }
+                } catch (Exception ignored) {
+                    // Already closed, or the printer dropped mid-close.
+                }
+                synchronized (linkLock) {
+                    if (printerConnection == dying) {
+                        printerConnection = null;
+                        printer = null;
+                    }
+                }
+                // A connect that started after this drop owns the session now.
+                final boolean emitNow;
+                synchronized (linkLock) {
+                    emitNow = emit && generation == linkGeneration;
+                }
+                if (emitNow) {
+                    callHandlers("connectionLost", null);
+                }
+                if (result != null) {
+                    try {
+                        result.success("Not Connected");
+                    } catch (Exception ignored) {
+                        // Result was already completed by a racing loss path.
+                    }
+                }
+            }
+        }).start();
+    }
+
     public void checkPrinterStatus(final MethodChannel.Result result) {
         checkPrinterStatus(result, false);
     }
 
     public void checkPrinterStatus(final MethodChannel.Result result, final boolean sgdOnly) {
         tempIsPrinterConnect = true;
-        if (printerConnection != null && printerConnection.isConnected()) {
-            new Thread(new Runnable() {
-                public void run() {
+        final int generation;
+        final Connection connection;
+        synchronized (linkLock) {
+            generation = linkGeneration;
+        }
+        connection = printerConnection;
+        // sgdOnly polls must not reopen a dead socket — that hides power-off.
+        if (connection == null || !connection.isConnected()) {
+            reportUnexpectedLinkLoss(result, connection, generation);
+            return;
+        }
+        new Thread(new Runnable() {
+            public void run() {
+                if (!sgdOnly) {
                     try {
-                        printerConnection.open();
+                        connection.open();
                     } catch (ConnectionException e) {
-                        result.success("Not Connected");
+                        reportUnexpectedLinkLoss(result, connection, generation);
                         return;
                     }
-
-                    HashMap<String, Object> arguments = new HashMap<>();
-                    // Defaults when getCurrentStatus fails (malformed status blob).
-                    arguments.put("isHeadCold", false);
-                    arguments.put("isReadyToPrint", true);
-                    arguments.put("isHeadOpen", false);
-                    arguments.put("isPaperOut", false);
-                    arguments.put("isHeadTooHot", false);
-                    arguments.put("isPartialFormatInProgress", false);
-                    arguments.put("isPaused", false);
-                    arguments.put("isReceiveBufferFull", false);
-                    arguments.put("isRibbonOut", false);
-                    arguments.put("labelLengthInDots", 0);
-                    arguments.put("numberOfFormatsInReceiveBuffer", 0);
-                    arguments.put("printMode", 0);
-                    arguments.put("labelsRemainingInBatch", 0);
-
-                    // Periodic battery polls skip getCurrentStatus — it is slow and often malformed.
-                    if (!sgdOnly) {
-                        try {
-                            ZebraPrinter printer = ZebraPrinterFactory.getInstance(printerConnection);
-                            PrinterStatus printerStatus = printer.getCurrentStatus();
-                            MyPrinterStatus myPrinterStatus = new MyPrinterStatus(
-                                    printerStatus.isReadyToPrint,
-                                    printerStatus.isHeadOpen,
-                                    printerStatus.isHeadCold,
-                                    printerStatus.isHeadTooHot,
-                                    printerStatus.isPaperOut,
-                                    printerStatus.isRibbonOut,
-                                    printerStatus.isReceiveBufferFull,
-                                    printerStatus.isPaused,
-                                    printerStatus.labelLengthInDots,
-                                    printerStatus.numberOfFormatsInReceiveBuffer,
-                                    printerStatus.labelsRemainingInBatch,
-                                    printerStatus.isPartialFormatInProgress,
-                                    printerStatus.printMode.ordinal());
-                            arguments.put("isHeadCold", myPrinterStatus.isHeadCold);
-                            arguments.put("isReadyToPrint", myPrinterStatus.isReadyToPrint);
-                            arguments.put("isHeadOpen", myPrinterStatus.isHeadOpen);
-                            arguments.put("isPaperOut", myPrinterStatus.isPaperOut);
-                            arguments.put("isHeadTooHot", myPrinterStatus.isHeadTooHot);
-                            arguments.put("isPartialFormatInProgress", myPrinterStatus.isPartialFormatInProgress);
-                            arguments.put("isPaused", myPrinterStatus.isPaused);
-                            arguments.put("isReceiveBufferFull", myPrinterStatus.isReceiveBufferFull);
-                            arguments.put("isRibbonOut", myPrinterStatus.isRibbonOut);
-                            arguments.put("labelLengthInDots", myPrinterStatus.labelLengthInDots);
-                            arguments.put("numberOfFormatsInReceiveBuffer", myPrinterStatus.numberOfFormatsInReceiveBuffer);
-                            arguments.put("printMode", myPrinterStatus.printMode);
-                            arguments.put("labelsRemainingInBatch", myPrinterStatus.labelsRemainingInBatch);
-                        } catch (Exception e) {
-                            // Malformed status / language unknown — still read SGD battery below.
-                            android.util.Log.w("BatterySgd",
-                                    "getCurrentStatus failed: " + e.getMessage() + " — reading SGD battery anyway");
-                        }
-                    }
-
-                    Integer batteryPercent = readBatteryPercent(printerConnection);
-                    if (batteryPercent != null) {
-                        arguments.put("batteryPercent", batteryPercent);
-                    }
-                    android.util.Log.d("BatterySgd", "checkPrinterStatus sgdOnly=" + sgdOnly
-                            + " batteryPercent=" + batteryPercent);
-
-                    JsonAdapter<Map> adapter = moshi.adapter(Map.class);
-                    result.success(adapter.toJson(arguments));
+                } else {
+                    // Short read so a powered-off printer fails the poll in ~2s, not the SDK default.
+                    connection.setMaxTimeoutForRead(2000);
+                    connection.setTimeToWaitForMoreData(200);
                 }
-            }).start();
-        } else {
-            result.success("Not Connected");
-        }
+                if (!connection.isConnected()) {
+                    reportUnexpectedLinkLoss(result, connection, generation);
+                    return;
+                }
+
+                HashMap<String, Object> arguments = new HashMap<>();
+                // Defaults when getCurrentStatus fails (malformed status blob).
+                arguments.put("isHeadCold", false);
+                arguments.put("isReadyToPrint", true);
+                arguments.put("isHeadOpen", false);
+                arguments.put("isPaperOut", false);
+                arguments.put("isHeadTooHot", false);
+                arguments.put("isPartialFormatInProgress", false);
+                arguments.put("isPaused", false);
+                arguments.put("isReceiveBufferFull", false);
+                arguments.put("isRibbonOut", false);
+                arguments.put("labelLengthInDots", 0);
+                arguments.put("numberOfFormatsInReceiveBuffer", 0);
+                arguments.put("printMode", 0);
+                arguments.put("labelsRemainingInBatch", 0);
+
+                // Periodic battery polls skip getCurrentStatus — it is slow and often malformed.
+                if (!sgdOnly) {
+                    try {
+                        ZebraPrinter printer = ZebraPrinterFactory.getInstance(connection);
+                        PrinterStatus printerStatus = printer.getCurrentStatus();
+                        MyPrinterStatus myPrinterStatus = new MyPrinterStatus(
+                                printerStatus.isReadyToPrint,
+                                printerStatus.isHeadOpen,
+                                printerStatus.isHeadCold,
+                                printerStatus.isHeadTooHot,
+                                printerStatus.isPaperOut,
+                                printerStatus.isRibbonOut,
+                                printerStatus.isReceiveBufferFull,
+                                printerStatus.isPaused,
+                                printerStatus.labelLengthInDots,
+                                printerStatus.numberOfFormatsInReceiveBuffer,
+                                printerStatus.labelsRemainingInBatch,
+                                printerStatus.isPartialFormatInProgress,
+                                printerStatus.printMode.ordinal());
+                        arguments.put("isHeadCold", myPrinterStatus.isHeadCold);
+                        arguments.put("isReadyToPrint", myPrinterStatus.isReadyToPrint);
+                        arguments.put("isHeadOpen", myPrinterStatus.isHeadOpen);
+                        arguments.put("isPaperOut", myPrinterStatus.isPaperOut);
+                        arguments.put("isHeadTooHot", myPrinterStatus.isHeadTooHot);
+                        arguments.put("isPartialFormatInProgress", myPrinterStatus.isPartialFormatInProgress);
+                        arguments.put("isPaused", myPrinterStatus.isPaused);
+                        arguments.put("isReceiveBufferFull", myPrinterStatus.isReceiveBufferFull);
+                        arguments.put("isRibbonOut", myPrinterStatus.isRibbonOut);
+                        arguments.put("labelLengthInDots", myPrinterStatus.labelLengthInDots);
+                        arguments.put("numberOfFormatsInReceiveBuffer", myPrinterStatus.numberOfFormatsInReceiveBuffer);
+                        arguments.put("printMode", myPrinterStatus.printMode);
+                        arguments.put("labelsRemainingInBatch", myPrinterStatus.labelsRemainingInBatch);
+                    } catch (Exception e) {
+                        // Malformed status / language unknown — still read SGD battery below.
+                        android.util.Log.w("BatterySgd",
+                                "getCurrentStatus failed: " + e.getMessage() + " — reading SGD battery anyway");
+                    }
+                }
+
+                final Integer batteryPercent;
+                try {
+                    batteryPercent = readBatteryPercent(connection);
+                } catch (ConnectionException e) {
+                    reportUnexpectedLinkLoss(result, connection, generation);
+                    return;
+                }
+                if (batteryPercent != null) {
+                    arguments.put("batteryPercent", batteryPercent);
+                }
+                android.util.Log.d("BatterySgd", "checkPrinterStatus sgdOnly=" + sgdOnly
+                        + " batteryPercent=" + batteryPercent);
+
+                JsonAdapter<Map> adapter = moshi.adapter(Map.class);
+                try {
+                    result.success(adapter.toJson(arguments));
+                } catch (Exception ignored) {
+                    // Result was already completed.
+                }
+            }
+        }).start();
     }
 
 

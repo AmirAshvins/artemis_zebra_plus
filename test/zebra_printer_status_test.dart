@@ -1,4 +1,5 @@
 import 'package:artemis_zebra_plus/artemis_zebra.dart';
+import 'package:artemis_zebra_plus/zebra_link_status.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const Object _omitBattery = Object();
@@ -64,7 +65,45 @@ void main() {
     expect(again.batteryPercent, 35);
   });
 
-  test('fromJson coerces numeric printMode without dropping batteryPercent', () {
+  test('poll treats Not Connected and Not TCP as link loss', () {
+    expect(
+      interpretStatusPoll(rawText: 'Not Connected'),
+      StatusPollDecision.linkLost,
+    );
+    expect(
+      interpretStatusPoll(rawText: '  Not TCP  '),
+      StatusPollDecision.linkLost,
+    );
+  });
+
+  test('poll timeout and channel failure are link loss', () {
+    expect(interpretStatusPoll(timedOut: true), StatusPollDecision.linkLost);
+    expect(
+      interpretStatusPoll(
+          rawText: '{"isReadyToPrint":true}', channelFailed: true),
+      StatusPollDecision.linkLost,
+    );
+  });
+
+  test('poll JSON stays connected with or without battery', () {
+    expect(
+      interpretStatusPoll(
+          rawText: '{"isReadyToPrint":true,"batteryPercent":40}'),
+      StatusPollDecision.applyStatus,
+    );
+    expect(
+      interpretStatusPoll(rawText: '{"isReadyToPrint":true}'),
+      StatusPollDecision.applyStatus,
+    );
+  });
+
+  test('poll ignores garbage that is not a dead-link token', () {
+    expect(interpretStatusPoll(rawText: ''), StatusPollDecision.ignore);
+    expect(interpretStatusPoll(rawText: 'null'), StatusPollDecision.ignore);
+  });
+
+  test('fromJson coerces numeric printMode without dropping batteryPercent',
+      () {
     final json = baseJson(batteryPercent: 88);
     json['printMode'] = 2.0; // Swift/JSON number edge case
     final status = ZebraPrinterStatus.fromJson(json);

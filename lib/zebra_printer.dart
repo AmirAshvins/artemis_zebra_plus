@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 
 import 'artemis_zebra.dart';
+import 'zebra_link_status.dart';
 import 'zebra_logging.dart';
 import 'zebra_printer_interface.dart';
 
@@ -35,7 +36,10 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
 
   Timer? _statusPollTimer;
 
-  ZebraPrinter(String id, {String? label, required void Function(ZebraPrinter) notifierFunction,Function? statusListener}) {
+  ZebraPrinter(String id,
+      {String? label,
+      required void Function(ZebraPrinter) notifierFunction,
+      Function? statusListener}) {
     channel = MethodChannel('ZebraPrinterInstance$id');
     zebraPackageLog("ZebraPrinterInstanceCreated: $id  (${label ?? id})");
     instanceID = label == null ? id : "$id ($label)";
@@ -53,7 +57,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   @override
   checkPermissions() async {
     return true;
-    if(Platform.isIOS) return true;
+    if (Platform.isIOS) return true;
     bool result = await channel.invokeMethod("checkPermissions");
     return result;
   }
@@ -62,7 +66,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   discoverPrinters() async {
     bool permissions = await checkPermissions();
     if (permissions) {
-      if(status != PrinterStatus.ready){
+      if (status != PrinterStatus.ready) {
         status = PrinterStatus.discoveringPrinter;
         notifier(this);
       }
@@ -72,11 +76,12 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       // that silently disables battery polls until a later connect.
       if (status == PrinterStatus.discoveringPrinter) {
         status = PrinterStatus.disconnected;
-        zebraPackageLog('Zebra discover done [$instanceID] → status=disconnected (ready for connect/poll)');
+        zebraPackageLog(
+            'Zebra discover done [$instanceID] → status=disconnected (ready for connect/poll)');
         notifier(this);
       }
       return result;
-    }else{
+    } else {
       return "No Permission";
     }
   }
@@ -86,27 +91,33 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     final int epoch = ++_sessionEpoch;
     status = PrinterStatus.connecting;
     notifier(this);
-    zebraPackageLog('Zebra connect begin [$instanceID] address=$address epoch=$epoch');
-    final bool result = await channel.invokeMethod("connectToPrinter", {"address": address});
+    zebraPackageLog(
+        'Zebra connect begin [$instanceID] address=$address epoch=$epoch');
+    final bool result =
+        await channel.invokeMethod("connectToPrinter", {"address": address});
     // A newer connect/disconnect superseded this attempt.
     if (epoch != _sessionEpoch) {
-      zebraPackageLog('Zebra connect STALE [$instanceID] epoch=$epoch now=$_sessionEpoch result=$result — ignoring');
+      zebraPackageLog(
+          'Zebra connect STALE [$instanceID] epoch=$epoch now=$_sessionEpoch result=$result — ignoring');
       return false;
     }
     if (result) {
       zebraPackagePrint("result is true");
       status = PrinterStatus.ready;
-      zebraPackageLog("Zebra Instance $instanceID Connected to $address (status=$status, epoch=$epoch, listener=${broadcaster != null})");
+      zebraPackageLog(
+          "Zebra Instance $instanceID Connected to $address (status=$status, epoch=$epoch, listener=${broadcaster != null})");
       notifier(this);
       // Fire-and-forget: do not block connect UI on SGD/status round-trip.
-      zebraPackageLog('Zebra post-connect poll scheduled [$instanceID] epoch=$epoch');
+      zebraPackageLog(
+          'Zebra post-connect poll scheduled [$instanceID] epoch=$epoch');
       unawaited(_pollPrinterStatusOnce(broadcaster, reason: 'post-connect'));
       startStatusPolling();
       return result;
     } else {
       zebraPackagePrint("result is false");
       status = PrinterStatus.disconnected;
-      zebraPackageLog('Zebra connect FAILED [$instanceID] address=$address epoch=$epoch');
+      zebraPackageLog(
+          'Zebra connect FAILED [$instanceID] address=$address epoch=$epoch');
       notifier(this);
       return result;
     }
@@ -144,8 +155,10 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   Future<bool> disconnectPrinter() async {
     // Already down — skip native close so we do not queue a late connectionLost
     // that would wipe a subsequent connectToPrinter.
-    if (status == PrinterStatus.disconnected || status == PrinterStatus.disconnecting) {
-      zebraPackageLog('Zebra disconnect SKIP [$instanceID] already status=$status');
+    if (status == PrinterStatus.disconnected ||
+        status == PrinterStatus.disconnecting) {
+      zebraPackageLog(
+          'Zebra disconnect SKIP [$instanceID] already status=$status');
       stopStatusPolling();
       return true;
     }
@@ -153,7 +166,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     _intentionalDisconnect = true;
     final int epochAtDisconnect = _sessionEpoch;
     status = PrinterStatus.disconnecting;
-    zebraPackageLog('Zebra disconnect begin [$instanceID] intentional=true epoch=$epochAtDisconnect');
+    zebraPackageLog(
+        'Zebra disconnect begin [$instanceID] intentional=true epoch=$epochAtDisconnect');
     notifier(this);
     try {
       final bool result = await channel.invokeMethod("disconnectPrinter");
@@ -162,9 +176,11 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
         status = PrinterStatus.disconnected;
         notifier(this);
       } else {
-        zebraPackageLog('Zebra disconnect end STALE [$instanceID] epoch=$epochAtDisconnect now=$_sessionEpoch — not wiping newer session');
+        zebraPackageLog(
+            'Zebra disconnect end STALE [$instanceID] epoch=$epochAtDisconnect now=$_sessionEpoch — not wiping newer session');
       }
-      zebraPackageLog('Zebra disconnect end [$instanceID] result=$result statusNow=$status');
+      zebraPackageLog(
+          'Zebra disconnect end [$instanceID] result=$result statusNow=$status');
       return result;
     } finally {
       // Native may also emit connectionLost; keep flag briefly for that handler.
@@ -186,14 +202,14 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
 
   Future<dynamic> _printerMethodCallHandler(MethodCall methodCall) async {
     if (methodCall.method == "printerFound") {
-
       String? pJson = await methodCall.arguments;
       if (pJson == null) return null;
       try {
         zebraPackageLog(pJson);
         FoundPrinter foundPrinter = FoundPrinter.fromJson(jsonDecode(pJson));
         zebraPackageLog("printerFound : ${foundPrinter.toString()}");
-        if(!foundPrinters.any((element) => element.address==foundPrinter.address)) {
+        if (!foundPrinters
+            .any((element) => element.address == foundPrinter.address)) {
           foundPrinters.add(foundPrinter);
         }
         notifier(this);
@@ -211,32 +227,25 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       if (_intentionalDisconnect) {
         _intentionalDisconnect = false;
         // Intentional close raced with a new connect — do not wipe ready/connecting.
-        if (prev == PrinterStatus.connecting || prev == PrinterStatus.ready || prev == PrinterStatus.printing) {
-          zebraPackageLog('printerDisconnected (intentional STALE ignored) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch');
+        if (prev == PrinterStatus.connecting ||
+            prev == PrinterStatus.ready ||
+            prev == PrinterStatus.printing) {
+          zebraPackageLog(
+            'printerDisconnected (intentional STALE ignored) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch',
+          );
           return null;
         }
-        status = PrinterStatus.disconnected;
-        notifier(this);
-        final zStatus = ZebraPrinterStatus.disconnected();
-        zebraPrinterStatus = zStatus;
-        broadcaster?.call(zStatus);
-        zebraPackageLog("printerDisconnected (intentional) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch");
-        stopStatusPolling();
+        _markLinkLost('intentional');
         return null;
       }
-      // Unexpected drop — still ignore if a newer connect is already in flight/ready
-      // only when we just started connecting after this lost (epoch handles disconnect→connect).
+      // Unexpected drop during connect belongs to the previous socket.
       if (prev == PrinterStatus.connecting) {
-        zebraPackageLog('printerDisconnected (connectionLost during connecting — keeping connecting) [$instanceID]');
+        zebraPackageLog(
+          'printerDisconnected (connectionLost during connecting — keeping connecting) [$instanceID]',
+        );
         return null;
       }
-      status = PrinterStatus.disconnected;
-      notifier(this);
-      final zStatus = ZebraPrinterStatus.disconnected();
-      zebraPrinterStatus = zStatus;
-      broadcaster?.call(zStatus);
-      zebraPackageLog("printerDisconnected (connectionLost) [$instanceID] prevStatus=$prev epoch=$_sessionEpoch");
-      stopStatusPolling();
+      _markLinkLost('connectionLost');
     }
   }
 
@@ -273,73 +282,164 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       command = '''~jc^xa^jus^xz''';
     }
 
-      zebraPackageLog("Setting => $command");
-      status = PrinterStatus.printing;
-      notifier(this);
-      await Future.delayed(const Duration(milliseconds: 300));
-      await channel.invokeMethod("printData", {"data": command});
-      status = PrinterStatus.ready;
-      notifier(this);
-
+    zebraPackageLog("Setting => $command");
+    status = PrinterStatus.printing;
+    notifier(this);
+    await Future.delayed(const Duration(milliseconds: 300));
+    await channel.invokeMethod("printData", {"data": command});
+    status = PrinterStatus.ready;
+    notifier(this);
   }
 
- @override
-  Future<String> checkPrinterStatus()async {
+  @override
+  Future<String> checkPrinterStatus() async {
     return await channel.invokeMethod("checkPrinterStatus");
   }
+
   @override
-  Future<String> sendZplOverTcp()async {
+  Future<String> sendZplOverTcp() async {
     return await channel.invokeMethod("sendZplOverTcp");
   }
+
   @override
-  Future<String> sendCpclOverTcp()async {
+  Future<String> sendCpclOverTcp() async {
     return await channel.invokeMethod("sendCpclOverTcp");
   }
+
   @override
-  Future<String> sampleWithGCD()async {
+  Future<String> sampleWithGCD() async {
     return await channel.invokeMethod("sampleWithGCD");
   }
 
+  /// Marks the session down and publishes disconnected chrome before listeners run.
+  ///
+  /// Ignored while [PrinterStatus.connecting] so a late drop from the previous
+  /// socket cannot cancel an in-flight connect. Already-disconnected is a no-op
+  /// so ACL and the poll can both report the same drop.
+  void _markLinkLost(String reason) {
+    if (status == PrinterStatus.disconnected) {
+      stopStatusPolling();
+      return;
+    }
+    if (status == PrinterStatus.connecting) {
+      zebraPackageLog(
+        'printerDisconnected ignored ($reason) [$instanceID] status=connecting epoch=$_sessionEpoch',
+      );
+      return;
+    }
+    status = PrinterStatus.disconnected;
+    final zStatus = ZebraPrinterStatus.disconnected();
+    zebraPrinterStatus = zStatus;
+    zebraPackageLog(
+      'printerDisconnected ($reason) [$instanceID] epoch=$_sessionEpoch',
+    );
+    notifier(this);
+    broadcaster?.call(zStatus);
+    stopStatusPolling();
+  }
+
+  /// Applies link loss only if this poll still belongs to the ready session.
+  ///
+  /// A connect bumps [_sessionEpoch]. A late "Not Connected" from the previous
+  /// poll must not tear down the new session.
+  void _dropLinkIfSameSession(int epoch, String reason) {
+    if (epoch != _sessionEpoch || status != PrinterStatus.ready) {
+      zebraPackageLog(
+        'printerDisconnected STALE ($reason) [$instanceID] epoch=$epoch now=$_sessionEpoch status=$status',
+      );
+      return;
+    }
+    _markLinkLost(reason);
+  }
+
   /// One status/SGD poll: updates [zebraPrinterStatus], notifies [listener], and logs battery %.
-  Future<void> _pollPrinterStatusOnce(Function? listener, {String reason = 'loop'}) async {
+  ///
+  /// Runs only while [status] is [PrinterStatus.ready]. A print holds the port,
+  /// so a failed SGD read during [PrinterStatus.printing] must not look like
+  /// power-off — the print write already disconnects when the socket throws.
+  Future<void> _pollPrinterStatusOnce(
+    Function? listener, {
+    String reason = 'loop',
+  }) async {
     final int tick = ++_batteryPollTick;
+    final int epochAtPoll = _sessionEpoch;
     final PrinterStatus statusSnapshot = status;
-    // Avoid native SGD/status traffic while disconnected — it is slow and noisy.
-    if (statusSnapshot != PrinterStatus.ready && statusSnapshot != PrinterStatus.printing) {
-      zebraPackageLog('Zebra battery poll SKIP [$instanceID] tick=$tick reason=$reason status=$statusSnapshot inFlight=$_batteryPollInFlight');
+    if (statusSnapshot != PrinterStatus.ready) {
+      zebraPackageLog(
+        'Zebra battery poll SKIP [$instanceID] tick=$tick reason=$reason status=$statusSnapshot inFlight=$_batteryPollInFlight',
+      );
       return;
     }
     if (_batteryPollInFlight) {
-      zebraPackageLog('Zebra battery poll SKIP-OVERLAP [$instanceID] tick=$tick reason=$reason status=$statusSnapshot');
+      zebraPackageLog(
+        'Zebra battery poll SKIP-OVERLAP [$instanceID] tick=$tick reason=$reason status=$statusSnapshot',
+      );
       return;
     }
     _batteryPollInFlight = true;
     final sw = Stopwatch()..start();
-    zebraPackageLog('Zebra battery poll ENTER [$instanceID] tick=$tick reason=$reason status=$statusSnapshot listener=${listener != null}');
+    zebraPackageLog(
+      'Zebra battery poll ENTER [$instanceID] tick=$tick reason=$reason status=$statusSnapshot listener=${listener != null}',
+    );
     try {
       // Connected polls are SGD-only (battery); skip slow getCurrentStatus.
-      // Hard timeout so a stuck native SGD cannot kill the 5s broadcast loop.
-      final dynamic raw = await channel
-          .invokeMethod('checkPrinterStatus', {'sgdOnly': true})
-          .timeout(const Duration(seconds: 8));
-      final String rawText = raw?.toString() ?? 'null';
-      zebraPackageLog('Zebra battery poll RAW [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} len=${rawText.length} head="${rawText.length > 180 ? rawText.substring(0, 180) : rawText}"');
+      // Hard timeout so a stuck native SGD cannot leave the session looking ready.
+      final dynamic raw = await channel.invokeMethod('checkPrinterStatus',
+          {'sgdOnly': true}).timeout(const Duration(seconds: 8));
+      final String rawText = raw?.toString() ?? '';
+      zebraPackageLog(
+        'Zebra battery poll RAW [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} len=${rawText.length} head="${rawText.length > 180 ? rawText.substring(0, 180) : rawText}"',
+      );
+      final decision = interpretStatusPoll(rawText: rawText);
+      if (decision == StatusPollDecision.linkLost) {
+        _dropLinkIfSameSession(epochAtPoll, 'poll:$rawText');
+        return;
+      }
+      if (decision != StatusPollDecision.applyStatus) {
+        zebraPackageLog(
+          'Zebra battery poll IGNORE [$instanceID] tick=$tick raw="$rawText"',
+        );
+        return;
+      }
       try {
-        final parsed = ZebraPrinterStatus.fromJson(jsonDecode(rawText) as Map<String, dynamic>);
+        final parsed = ZebraPrinterStatus.fromJson(
+          jsonDecode(rawText) as Map<String, dynamic>,
+        );
+        // A newer connect or an earlier connectionLost owns the session now.
+        if (epochAtPoll != _sessionEpoch || status != PrinterStatus.ready) {
+          zebraPackageLog(
+            'Zebra battery poll STALE [$instanceID] tick=$tick epoch=$epochAtPoll now=$_sessionEpoch status=$status',
+          );
+          return;
+        }
         zebraPrinterStatus = parsed;
-        zebraPackageLog('Zebra battery poll OK [$instanceID] tick=$tick batteryPercent=${parsed.batteryPercent} ready=${parsed.isReadyToPrint} callingListener=${listener != null}');
+        zebraPackageLog(
+          'Zebra battery poll OK [$instanceID] tick=$tick batteryPercent=${parsed.batteryPercent} ready=${parsed.isReadyToPrint} callingListener=${listener != null}',
+        );
         listener?.call(parsed);
-        zebraPackageLog('Zebra battery poll LISTENER-DONE [$instanceID] tick=$tick');
+        zebraPackageLog(
+          'Zebra battery poll LISTENER-DONE [$instanceID] tick=$tick',
+        );
       } catch (e) {
-        zebraPackageLog('Zebra battery poll PARSE-FAIL [$instanceID] tick=$tick raw="$rawText" error=$e');
+        zebraPackageLog(
+          'Zebra battery poll PARSE-FAIL [$instanceID] tick=$tick raw="$rawText" error=$e',
+        );
       }
     } on TimeoutException catch (e) {
-      zebraPackageLog('Zebra battery poll TIMEOUT [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} error=$e — native SGD likely hung');
+      zebraPackageLog(
+        'Zebra battery poll TIMEOUT [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} error=$e — native SGD likely hung',
+      );
+      _dropLinkIfSameSession(epochAtPoll, 'poll-timeout');
     } catch (e) {
-      zebraPackageLog('Zebra battery poll CHANNEL-FAIL [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} error=$e');
+      zebraPackageLog(
+        'Zebra battery poll CHANNEL-FAIL [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} error=$e',
+      );
+      _dropLinkIfSameSession(epochAtPoll, 'poll-channel');
     } finally {
       _batteryPollInFlight = false;
-      zebraPackageLog('Zebra battery poll EXIT [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} statusNow=$status');
+      zebraPackageLog(
+        'Zebra battery poll EXIT [$instanceID] tick=$tick ms=${sw.elapsedMilliseconds} statusNow=$status',
+      );
     }
   }
 
@@ -347,7 +447,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   void startStatusPolling() {
     if (_statusPollingEnabled) return;
     _statusPollingEnabled = true;
-    zebraPackageLog('Zebra battery loop START [$instanceID] listener=${broadcaster != null}');
+    zebraPackageLog(
+        'Zebra battery loop START [$instanceID] listener=${broadcaster != null}');
     _statusPollTimer?.cancel();
     _statusPollTimer = Timer.periodic(const Duration(seconds: 20), (_) {
       if (!_statusPollingEnabled) return;

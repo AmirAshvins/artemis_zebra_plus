@@ -134,6 +134,14 @@ andWithTimeToWaitForMoreData:200
 }
 
 + (NSNumber *)batteryPercentFromConnection:(id<ZebraPrinterConnection, NSObject>)connection {
+    return [self batteryPercentFromConnection:connection linkFailed:NULL];
+}
+
++ (NSNumber *)batteryPercentFromConnection:(id<ZebraPrinterConnection, NSObject>)connection
+                                 linkFailed:(BOOL *)linkFailed {
+    if (linkFailed != NULL) {
+        *linkFailed = NO;
+    }
     @try {
         NSLog(@"[BatterySgd] begin connected=%@",
               [connection isConnected] ? @"YES" : @"NO");
@@ -150,6 +158,16 @@ andWithTimeToWaitForMoreData:200
               sourceError.localizedDescription ?: @"nil",
               (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
 
+        // A transport error with no scalar means the radio is gone. An unparseable
+        // scalar without an error is AC power or an unknown key, not a disconnect.
+        if (sourceError != nil && ![self _looksLikeValidSgdScalar:sourceRaw]) {
+            NSLog(@"[BatterySgd] link failed power.source error=%@", sourceError);
+            if (linkFailed != NULL) {
+                *linkFailed = YES;
+            }
+            return nil;
+        }
+
         // Missing / garbage source must not block charge reads — only skip on clear AC/line/mains.
         if ([self _looksLikeValidSgdScalar:sourceRaw] && [self _isAcPowerSource:source]) {
             NSLog(@"[BatterySgd] skipping percent — AC/line/mains source '%@'", source);
@@ -161,6 +179,9 @@ andWithTimeToWaitForMoreData:200
         return parsed;
     } @catch (NSException *exception) {
         NSLog(@"[BatterySgd] exception: %@", exception);
+        if (linkFailed != NULL) {
+            *linkFailed = YES;
+        }
         return nil;
     }
 }
