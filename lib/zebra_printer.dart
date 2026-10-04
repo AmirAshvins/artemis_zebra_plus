@@ -31,7 +31,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   /// True while a battery poll invokeMethod is in flight (detect overlapping hangs).
   bool _batteryPollInFlight = false;
 
-  /// When false, the 20s SGD timer is cancelled (disconnect / dispose / background).
+  /// When false, the 5s SGD timer is cancelled (disconnect / dispose / background).
   bool _statusPollingEnabled = false;
 
   Timer? _statusPollTimer;
@@ -443,14 +443,17 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     }
   }
 
-  /// Starts a 20s SGD battery poll. No-op when already running or disconnected.
+  /// Starts a 5s SGD battery poll. No-op when already running or disconnected.
+  ///
+  /// Five seconds plus the 8s hang timeout stays under a 15s detection cap
+  /// when the OS never posts a disconnect event.
   void startStatusPolling() {
     if (_statusPollingEnabled) return;
     _statusPollingEnabled = true;
     zebraPackageLog(
         'Zebra battery loop START [$instanceID] listener=${broadcaster != null}');
     _statusPollTimer?.cancel();
-    _statusPollTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+    _statusPollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (!_statusPollingEnabled) return;
       unawaited(_pollPrinterStatusOnce(broadcaster, reason: 'loop'));
     });
@@ -471,7 +474,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     channel.setMethodCallHandler(null);
   }
 
-  /// Polls printer status (incl. SGD battery) every 20s and fans out to [listener].
+  /// Polls printer status (incl. SGD battery) every 5s and fans out to [listener].
   ///
   /// Kept for callers that still invoke the old loop; prefer [startStatusPolling].
   void broadCastStatus(Function? listener) {
