@@ -86,6 +86,17 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     }
   }
 
+  /// Shows the iOS Bluetooth accessory picker without blocking discovery.
+  ///
+  /// Returns once the picker is requested. A chosen printer arrives later as
+  /// `printerFound`. No-op on Android, which scans without this picker.
+  Future<bool> showBluetoothAccessoryPicker() async {
+    if (!Platform.isIOS) return false;
+    final bool shown =
+        await channel.invokeMethod("showBluetoothAccessoryPicker");
+    return shown;
+  }
+
   @override
   Future<bool> connectToPrinter(String address) async {
     final int epoch = ++_sessionEpoch;
