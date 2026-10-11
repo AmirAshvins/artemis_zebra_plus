@@ -70,8 +70,15 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
         status = PrinterStatus.discoveringPrinter;
         notifier(this);
       }
+      if (Platform.isIOS) {
+        // A printer found before sleep must not stay tappable after iOS drops it.
+        foundPrinters = [];
+        notifier(this);
+      }
 
       String result = await channel.invokeMethod("discoverPrinters");
+      zebraTrace(
+          'discover done [$instanceID] status=$status result=$result found=${foundPrinters.length}');
       // Discovery must not leave the session stuck in discoveringPrinter forever —
       // that silently disables battery polls until a later connect.
       if (status == PrinterStatus.discoveringPrinter) {
@@ -99,17 +106,22 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
 
   @override
   Future<bool> connectToPrinter(String address) async {
+    final PrinterStatus statusBefore = status;
     final int epoch = ++_sessionEpoch;
     status = PrinterStatus.connecting;
     notifier(this);
     zebraPackageLog(
         'Zebra connect begin [$instanceID] address=$address epoch=$epoch');
+    zebraTrace(
+        'connect begin [$instanceID] address=$address epoch=$epoch statusWas=$statusBefore');
     final bool result =
         await channel.invokeMethod("connectToPrinter", {"address": address});
     // A newer connect/disconnect superseded this attempt.
     if (epoch != _sessionEpoch) {
       zebraPackageLog(
           'Zebra connect STALE [$instanceID] epoch=$epoch now=$_sessionEpoch result=$result — ignoring');
+      zebraTrace(
+          'connect STALE [$instanceID] epoch=$epoch now=$_sessionEpoch result=$result');
       return false;
     }
     if (result) {
@@ -117,6 +129,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       status = PrinterStatus.ready;
       zebraPackageLog(
           "Zebra Instance $instanceID Connected to $address (status=$status, epoch=$epoch, listener=${broadcaster != null})");
+      zebraTrace('connect OK [$instanceID] address=$address epoch=$epoch');
       notifier(this);
       // Fire-and-forget: do not block connect UI on SGD/status round-trip.
       zebraPackageLog(
@@ -129,6 +142,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       status = PrinterStatus.disconnected;
       zebraPackageLog(
           'Zebra connect FAILED [$instanceID] address=$address epoch=$epoch');
+      zebraTrace(
+          'connect FAILED [$instanceID] address=$address epoch=$epoch status=$status');
       notifier(this);
       return result;
     }
@@ -152,6 +167,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     }
 
     final bool result = await channel.invokeMethod("printData", {"data": data});
+    zebraTrace(
+        'print [$instanceID] result=$result bytes=${data.length} statusBefore=printing');
     if (result) {
       status = PrinterStatus.ready;
       zebraPackageLog("Zebra Instance $instanceID Print Done");
@@ -170,16 +187,28 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
         status == PrinterStatus.disconnecting) {
       zebraPackageLog(
           'Zebra disconnect SKIP [$instanceID] already status=$status');
+      zebraTrace('disconnect SKIP [$instanceID] status=$status');
       stopStatusPolling();
       return true;
     }
     stopStatusPolling();
     _intentionalDisconnect = true;
+    // Always clear the flag. notifier() can throw during a widget build, and
+    // that used to skip this timer so every later connectionLost looked intentional.
+    Future<void>.delayed(const Duration(milliseconds: 800), () {
+      _intentionalDisconnect = false;
+    });
     final int epochAtDisconnect = _sessionEpoch;
     status = PrinterStatus.disconnecting;
     zebraPackageLog(
         'Zebra disconnect begin [$instanceID] intentional=true epoch=$epochAtDisconnect');
-    notifier(this);
+    zebraTrace(
+        'disconnect begin [$instanceID] epoch=$epochAtDisconnect');
+    try {
+      notifier(this);
+    } catch (e) {
+      zebraTrace('disconnect notifier failed [$instanceID] $e');
+    }
     try {
       final bool result = await channel.invokeMethod("disconnectPrinter");
       // Only mark disconnected if no newer connect started meanwhile.
@@ -219,6 +248,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
         zebraPackageLog(pJson);
         FoundPrinter foundPrinter = FoundPrinter.fromJson(jsonDecode(pJson));
         zebraPackageLog("printerFound : ${foundPrinter.toString()}");
+        zebraTrace(
+            'printerFound [$instanceID] ${foundPrinter.name} ${foundPrinter.address} connected=${foundPrinter.isConnected}');
         if (!foundPrinters
             .any((element) => element.address == foundPrinter.address)) {
           foundPrinters.add(foundPrinter);
@@ -235,6 +266,8 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
       zebraPackageLog("discoveryError : $error");
     } else if (methodCall.method == "connectionLost") {
       final prev = status;
+      zebraTrace(
+          'connectionLost [$instanceID] prev=$prev intentional=$_intentionalDisconnect epoch=$_sessionEpoch');
       if (_intentionalDisconnect) {
         _intentionalDisconnect = false;
         // Intentional close raced with a new connect — do not wipe ready/connecting.
@@ -330,12 +363,15 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
   void _markLinkLost(String reason) {
     if (status == PrinterStatus.disconnected) {
       stopStatusPolling();
+      zebraTrace('linkLost ignored [$instanceID] already disconnected reason=$reason');
       return;
     }
     if (status == PrinterStatus.connecting) {
       zebraPackageLog(
         'printerDisconnected ignored ($reason) [$instanceID] status=connecting epoch=$_sessionEpoch',
       );
+      zebraTrace(
+          'linkLost ignored [$instanceID] still connecting reason=$reason epoch=$_sessionEpoch');
       return;
     }
     status = PrinterStatus.disconnected;
@@ -344,6 +380,7 @@ class ZebraPrinter implements ArtemisZebraPrinterInterface {
     zebraPackageLog(
       'printerDisconnected ($reason) [$instanceID] epoch=$_sessionEpoch',
     );
+    zebraTrace('linkLost [$instanceID] reason=$reason epoch=$_sessionEpoch');
     notifier(this);
     broadcaster?.call(zStatus);
     stopStatusPolling();

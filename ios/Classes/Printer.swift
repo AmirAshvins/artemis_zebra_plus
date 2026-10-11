@@ -19,6 +19,9 @@ class Printer{
     var isZebraPrinter :Bool = true
     var wifiManager: POSWIFIManager?
     var isConnecting :Bool = false
+    /// Same-serial connect calls wait on the attempt already running.
+    private var connectWaiters: [FlutterResult] = []
+    private var connectInFlightAddress: String?
     var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     /// Bumped on connect/disconnect so a late EA drop cannot kill the next session.
@@ -36,12 +39,32 @@ class Printer{
     private static let discoveryEmitDelay: TimeInterval = 0.5
     /// A second showBluetoothAccessoryPicker while one is up never gets a completion.
     private static var accessoryPickerVisible = false
+    private static var accessoryConnectObserver: NSObjectProtocol?
+    private static var livePrinters: [LivePrinter] = []
+    private static let livePrintersLock = NSLock()
+
+    /// Weak so a disposed Flutter instance does not stay in the connect fan-out.
+    private final class LivePrinter {
+        weak var printer: Printer?
+        init(_ printer: Printer) { self.printer = printer }
+    }
 
     
     static func getInstance(binaryMessenger : FlutterBinaryMessenger) -> Printer {
         let printer = Printer()
         printer.setMethodChannel(binaryMessenger: binaryMessenger)
+        Printer.track(printer)
         return printer
+    }
+
+    /// Remember [printer] so EAAccessoryDidConnect can publish on its channel.
+    private static func track(_ printer: Printer) {
+        livePrintersLock.lock()
+        livePrinters.removeAll { $0.printer == nil }
+        if !livePrinters.contains(where: { $0.printer === printer }) {
+            livePrinters.append(LivePrinter(printer))
+        }
+        livePrintersLock.unlock()
     }
     
     
@@ -127,6 +150,7 @@ class Printer{
 
         let register = {
             EAAccessoryManager.shared().registerForLocalNotifications()
+            Printer.installAccessoryConnectObserver()
             NSLog("[Zebra] registered for EA accessory notifications")
         }
         if Thread.isMainThread {
@@ -136,56 +160,174 @@ class Printer{
         }
     }
 
+    /// Publishes a new MFi accessory when iOS attaches it.
+    ///
+    /// The same socket does not survive a drop. The replacement is a new
+    /// EAAccessory, and a scan that already returned never sees it unless
+    /// this observer is running.
+    private static func installAccessoryConnectObserver() {
+        guard accessoryConnectObserver == nil else { return }
+        accessoryConnectObserver = NotificationCenter.default.addObserver(
+            forName: .EAAccessoryDidConnect,
+            object: nil,
+            queue: .main
+        ) { note in
+            guard let accessory = note.userInfo?[EAAccessoryKey] as? EAAccessory else { return }
+            guard accessory.protocolStrings.contains(zebraRawPortProtocol) else { return }
+            NSLog(
+                "[Zebra] EAAccessory connected name=%@ serial=%@ id=%ld accOpen=%d",
+                accessory.name,
+                accessory.serialNumber,
+                CLong(accessory.connectionID),
+                accessory.isConnected ? 1 : 0
+            )
+            livePrintersLock.lock()
+            livePrinters.removeAll { $0.printer == nil }
+            let printers = livePrinters.compactMap { $0.printer }
+            livePrintersLock.unlock()
+            for printer in printers {
+                printer.emitZebraAccessory(accessory)
+            }
+        }
+    }
+
+    /// True when a Link-OS accessory is in `connectedAccessories`.
+    ///
+    /// Pass [serial] to require that printer. Call off the main thread only
+    /// when followed by a sleep loop.
+    private func hasZebraAccessory(serial: String?) -> Bool {
+        let read = { () -> Bool in
+            EAAccessoryManager.shared().connectedAccessories.contains { accessory in
+                guard accessory.protocolStrings.contains(Printer.zebraRawPortProtocol) else {
+                    return false
+                }
+                if let serial = serial {
+                    return accessory.serialNumber == serial
+                }
+                return true
+            }
+        }
+        if Thread.isMainThread {
+            return read()
+        }
+        return DispatchQueue.main.sync(execute: read)
+    }
+
+    /// Polls until [serial] is present or absent, or [timeout] elapses.
+    /// Must run off the main thread.
+    private func waitForZebraAccessory(serial: String?, present: Bool, timeout: TimeInterval) {
+        let started = Date()
+        logLink("wait \(present ? "present" : "absent") start serial=\(serial ?? "*") timeout=\(timeout)")
+        let deadline = started.addingTimeInterval(timeout)
+        while Date() < deadline {
+            if hasZebraAccessory(serial: serial) == present {
+                logLink(String(
+                    format: "wait %@ matched elapsed=%.1f serial=%@",
+                    present ? "present" : "absent",
+                    Date().timeIntervalSince(started),
+                    serial ?? "*"
+                ))
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        logLink(String(
+            format: "wait %@ TIMEOUT elapsed=%.1f serial=%@",
+            present ? "present" : "absent",
+            Date().timeIntervalSince(started),
+            serial ?? "*"
+        ))
+    }
+
+    /// One line of reconnect state. Safe from any thread. Do not call while holding linkLock.
+    private func logLink(_ reason: String) {
+        let write = {
+            let socketDesc = self.connection?.toString() ?? "nil"
+            let socketOpen: String
+            if let bluetooth = self.connection as? MfiBtPrinterConnection {
+                socketOpen = bluetooth.isConnected() ? "open" : "closed"
+            } else if let tcp = self.connection as? TcpPrinterConnection {
+                socketOpen = tcp.isConnected() ? "open" : "closed"
+            } else if self.connection == nil {
+                socketOpen = "nil"
+            } else {
+                socketOpen = "unknown-type"
+            }
+            let accessories = EAAccessoryManager.shared().connectedAccessories
+                .filter { $0.protocolStrings.contains(Printer.zebraRawPortProtocol) }
+                .map {
+                    "\($0.serialNumber)/\($0.name)/id=\($0.connectionID)/accOpen=\($0.isConnected)"
+                }
+                .joined(separator: " | ")
+            print(
+                "[Zebra] \(reason) instance=\(self.toString()) connecting=\(self.isConnecting ? 1 : 0) inflight=\(self.connectInFlightAddress ?? "-") waiters=\(self.connectWaiters.count) gen=\(self.linkGeneration) socket=\(socketDesc)(\(socketOpen)) saved=\(self.selectedIPAddress ?? "-") ea=[\(accessories.isEmpty ? "none" : accessories)]"
+            )
+        }
+        if Thread.isMainThread {
+            write()
+        } else {
+            DispatchQueue.main.sync(execute: write)
+        }
+    }
+
     func discoverPrinters(result: @escaping FlutterResult){
         dummyConnect()
         Printer.registerForAccessoryNotifications()
 
-        // List only. The accessory picker is a separate call after the sheet is
-        // on screen — presenting it here never showed and never completed.
-        let discover = {
-            let found = self.emitConnectedZebraAccessories()
-            DispatchQueue.main.asyncAfter(deadline: .now() + Printer.discoveryEmitDelay) {
-                result("Discovery Done Devices Found: " + String(found))
-            }
+        // A held MFi session hides the printer after sleep. Release it the way
+        // Settings Disconnect does, then wait for iOS to list it again.
+        let shouldRelease = self.connection != nil && self.isConnecting == false
+        if shouldRelease {
+            self.beginLinkSession()
+            self.stopWatchingMfiDisconnect()
         }
-        if Thread.isMainThread {
-            discover()
-        } else {
-            DispatchQueue.main.async(execute: discover)
+        let saved = self.selectedIPAddress
+        let btSerial: String? = (saved?.contains(".") == false) ? saved : nil
+        logLink("discover begin release=\(shouldRelease) btSerial=\(btSerial ?? "-")")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            if shouldRelease {
+                self.connection?.close()
+                self.connection = nil
+            }
+            // iOS does not reattach a slept printer on its own. Waiting here
+            // only delays the sheet. The list is whatever is attached right now.
+            DispatchQueue.main.async {
+                let found = self.emitConnectedZebraAccessories()
+                self.logLink("discover emit found=\(found)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + Printer.discoveryEmitDelay) {
+                    result("Discovery Done Devices Found: " + String(found))
+                }
+            }
         }
     }
 
     /// Asks iOS to show the MFi picker. Returns before the picker is dismissed.
     ///
-    /// A one-bar printer stays paired but drops its idle session, so it is absent
-    /// from connectedAccessories until the user selects it here.
+    /// A slept printer is absent from connectedAccessories until the user
+    /// selects it here. That is the same attach as iOS Settings → Bluetooth.
     func showBluetoothAccessoryPicker(result: @escaping FlutterResult) {
         Printer.registerForAccessoryNotifications()
         let present = {
             if Printer.accessoryPickerVisible {
-                NSLog("[Zebra] accessory picker already visible — ignoring")
-                result(false)
+                print("[Zebra] accessory picker already visible")
+                result(true)
                 return
             }
             Printer.accessoryPickerVisible = true
             result(true)
-            // Next turn, after this channel callback returns. Presenting inside
-            // the callback is what left the picker invisible.
             DispatchQueue.main.async {
-                NSLog("[Zebra] showing Bluetooth accessory picker")
+                print("[Zebra] showing Bluetooth accessory picker")
                 EAAccessoryManager.shared().showBluetoothAccessoryPicker(withNameFilter: nil) { error in
                     DispatchQueue.main.async {
                         Printer.accessoryPickerVisible = false
-                        if let error = error {
-                            let nsError = error as NSError
-                            NSLog(
-                                "[Zebra] accessory picker error domain=%@ code=%ld %@",
-                                nsError.domain,
-                                CLong(nsError.code),
-                                nsError.localizedDescription
-                            )
+                        if let error = error as NSError? {
+                            print("[Zebra] picker closed domain=\(error.domain) code=\(error.code) \(error.localizedDescription)")
+                        } else {
+                            print("[Zebra] picker closed without error")
                         }
                         self.emitConnectedZebraAccessories()
+                        self.logLink("picker finished")
                     }
                 }
             }
@@ -195,6 +337,27 @@ class Printer{
         } else {
             DispatchQueue.main.async(execute: present)
         }
+    }
+
+    /// Publishes one connected Zebra MFi accessory on this instance channel.
+    private func emitZebraAccessory(_ accessory: EAAccessory) {
+        guard accessory.protocolStrings.contains(Printer.zebraRawPortProtocol) else { return }
+        NSLog(
+            "[Zebra] printer found name=%@ serial=%@",
+            accessory.name,
+            accessory.serialNumber
+        )
+        let data = DeviceData(
+            name: accessory.name,
+            address: accessory.serialNumber,
+            type: 1,
+            isConnected: accessory.isConnected
+        )
+        guard let jsonData = try? JSONEncoder().encode(data),
+              let json = String(data: jsonData, encoding: .utf8) else {
+            return
+        }
+        channel?.invokeMethod("printerFound", arguments: json)
     }
 
     /// Publishes connected Zebra MFi accessories on this instance channel.
@@ -207,22 +370,7 @@ class Printer{
             $0.protocolStrings.contains(Printer.zebraRawPortProtocol)
         }
         for accessory in devices {
-            NSLog(
-                "[Zebra] printer found name=%@ serial=%@",
-                accessory.name,
-                accessory.serialNumber
-            )
-            let data = DeviceData(
-                name: accessory.name,
-                address: accessory.serialNumber,
-                type: 1,
-                isConnected: accessory.isConnected
-            )
-            guard let jsonData = try? JSONEncoder().encode(data),
-                  let json = String(data: jsonData, encoding: .utf8) else {
-                continue
-            }
-            channel?.invokeMethod("printerFound", arguments: json)
+            emitZebraAccessory(accessory)
         }
         return devices.count
     }
@@ -258,19 +406,31 @@ class Printer{
     
     func connectToPrinter(address: String,result: @escaping FlutterResult){
         print("connecting instance  \(self.toString()) to " + address)
-        if self.isConnecting == false {
-            self.isConnecting = true
-            self.isZebraPrinter = true
+        linkLock.lock()
+        if self.isConnecting {
+            if self.connectInFlightAddress == address {
+                self.connectWaiters.append(result)
+                linkLock.unlock()
+                NSLog("[Zebra] connect joined in-flight address=%@", address)
+                return
+            }
+            linkLock.unlock()
+            // A different address cannot share this attempt.
+            NSLog("[Zebra] connect ignored, already connecting address=%@", address)
+            result(false)
+            return
+        }
+        self.isConnecting = true
+        self.connectInFlightAddress = address
+        linkLock.unlock()
+        logLink("connect start address=\(address)")
+
+        self.isZebraPrinter = true
             selectedIPAddress = nil
             // Previous socket's EA observer must not apply to this attempt.
             self.beginLinkSession()
             self.stopWatchingMfiDisconnect()
 
-            // Close any existing connection before starting a new one
-            if self.connection != nil {
-                self.connection?.close()
-            }
-            
             backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "PrinterConnection") {
                             // End the task if time expires
                             UIApplication.shared.endBackgroundTask(self.backgroundTask)
@@ -282,45 +442,51 @@ class Printer{
                 // IP addresses use TCP. MFi serials never contain a dot.
                 let isBluetooth = !address.contains(".")
                 var isOpen: Bool? = false
-                if isBluetooth {
-                    // A one-bar printer wakes the screen before the radio accepts
-                    // a new MFi session. Pause longer between fresh sockets.
-                    let pauses: [TimeInterval] = [1, 2, 3, 4]
-                    for (index, pause) in pauses.enumerated() {
+                    if isBluetooth {
+                        // open() succeeds only after iOS has attached the accessory.
+                        // A slept printer is absent from that list until the printer
+                        // sheet's system picker, or iOS Settings, attaches it.
+                        // Showing the picker here pops it under the flight screen,
+                        // where it is cancelled (error 2) and the real attempt is blocked.
                         self.connection?.close()
-                        self.connection = MfiBtPrinterConnection(serialNumber: address)
-                        Thread.sleep(forTimeInterval: pause)
-                        isOpen = self.connection?.open()
-                        if isOpen == true {
-                            break
+                        self.connection = nil
+                        if self.hasZebraAccessory(serial: address) {
+                            let pauses: [TimeInterval] = [0.3, 1.0]
+                            for (index, pause) in pauses.enumerated() {
+                                self.connection?.close()
+                                self.connection = MfiBtPrinterConnection(serialNumber: address)
+                                Thread.sleep(forTimeInterval: pause)
+                                isOpen = self.connection?.open()
+                                self.logLink("open attempt \(index + 1)/\(pauses.count) returned \(isOpen == true) pause=\(pause)")
+                                if isOpen == true {
+                                    if let connection = self.connection as? (ZebraPrinterConnection & NSObject) {
+                                        BatterySgd.disableBluetoothSniffModeIfNeeded(connection)
+                                    }
+                                    break
+                                }
+                            }
+                        } else {
+                            self.logLink("open skipped, iOS has not attached \(address)")
+                            isOpen = false
                         }
-                        NSLog(
-                            "[Zebra] MFi open attempt %ld/%ld failed serial=%@",
-                            CLong(index + 1),
-                            CLong(pauses.count),
-                            address
-                        )
-                    }
-                } else {
+                    } else {
+                    self.connection?.close()
                     self.connection = TcpPrinterConnection(address: address, andWithPort: 9100)
                     Thread.sleep(forTimeInterval: 1)
                     isOpen = self.connection?.open()
                 }
 
+                let opened = isOpen == true
                 DispatchQueue.main.async {
-                    self.isConnecting = false
-
-                    if isOpen == true {
+                    if opened {
                         Thread.sleep(forTimeInterval: 1)
                         self.selectedIPAddress = address
                         // MFi serials have no dot. TCP has no EAAccessory disconnect event.
                         if !address.contains(".") {
                             self.watchMfiDisconnect(serial: address)
                         }
-                        result(true)
-                    } else {
-                        result(false)
                     }
+                    self.finishConnect(opened: opened, owner: result)
                     
                     if self.backgroundTask != .invalid {
                         UIApplication.shared.endBackgroundTask(self.backgroundTask)
@@ -328,11 +494,20 @@ class Printer{
                     }
                 }
             }
-        } else {
-            // Leaving this result pending wedges the method channel until the
-            // in-flight open returns, which a slow low-battery radio may not.
-            NSLog("[Zebra] connect ignored, already connecting address=%@", address)
-            result(false)
+    }
+
+    /// Completes the in-flight connect and every same-serial caller waiting on it.
+    private func finishConnect(opened: Bool, owner: @escaping FlutterResult) {
+        linkLock.lock()
+        let waiters = connectWaiters
+        connectWaiters = []
+        isConnecting = false
+        connectInFlightAddress = nil
+        linkLock.unlock()
+        logLink("finishConnect opened=\(opened) extraWaiters=\(waiters.count)")
+        owner(opened)
+        for waiter in waiters {
+            waiter(opened)
         }
     }
     
@@ -357,21 +532,24 @@ class Printer{
     
     
     func disconnect(result: FlutterResult?) {
+        logLink("disconnect begin")
         // Own close also posts EAAccessoryDidDisconnect. Retire first so that
         // notification is not a second unexpected loss.
         self.beginLinkSession()
         self.stopWatchingMfiDisconnect()
+        let held = self.connection
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
             if self.isZebraPrinter {
-                if let connection = self.connection {
-                    connection.close()  // Close the connection in the background thread
-                }
+                held?.close()
                 DispatchQueue.main.async {
-                    // Notify the Flutter side that the connection is lost
+                    // A connect that already replaced this socket must keep it.
+                    if (self.connection as AnyObject?) === (held as AnyObject?) {
+                        self.connection = nil
+                    }
                     self.channel?.invokeMethod("connectionLost", arguments: nil)
-                    result?(true)  // Call the result callback on the main thread
+                    result?(true)
                 }
             } else {
                 if let wifiManager = self.wifiManager {
@@ -397,13 +575,29 @@ class Printer{
         DispatchQueue.global(qos: .utility).async {
             let dataBytes = Data(bytes: data.utf8String!, count: data.length)
             if self.isZebraPrinter == true {
+                // A print queued during reconnect must not write, and must not
+                // disconnect, until the in-flight open has finished.
+                let deadline = Date().addingTimeInterval(25)
+                while self.isConnecting && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.2)
+                }
+                guard let connection = self.connection, self.zebraSocketIsOpen(connection) else {
+                    self.logLink("print skipped")
+                    DispatchQueue.main.async { result(false) }
+                    return
+                }
                 var error: NSError?
-                let r = self.connection?.write(dataBytes, error: &error)
-                if r == -1, let error = error {
-                    print(error)
+                let r = connection.write(dataBytes, error: &error)
+                self.logLink("print write bytes=\(r) err=\(error?.localizedDescription ?? "nil")")
+                if r == -1 {
+                    print(error ?? "write failed")
+                    let closed = !self.zebraSocketIsOpen(connection) || self.isConnecting
+                    if closed {
+                        DispatchQueue.main.async { result(false) }
+                        return
+                    }
                     result(false)
                     self.disconnect(result: nil)
-                    
                     return
                 }
             } else {
@@ -416,6 +610,17 @@ class Printer{
                 result(true)
             }
         }
+    }
+
+    /// True when this Zebra socket is open. A closed object must not be written.
+    private func zebraSocketIsOpen(_ connection: ZebraPrinterConnection) -> Bool {
+        if let bluetooth = connection as? MfiBtPrinterConnection {
+            return bluetooth.isConnected()
+        }
+        if let tcp = connection as? TcpPrinterConnection {
+            return tcp.isConnected()
+        }
+        return false
     }
     
     func checkPrinterStatus(sgdOnly: Bool = false, result: @escaping FlutterResult) {
@@ -562,6 +767,7 @@ class Printer{
             guard let accessory = note.userInfo?[EAAccessoryKey] as? EAAccessory else { return }
             guard accessory.serialNumber == serial else { return }
             NSLog("[Zebra] EAAccessory disconnected serial=%@", serial)
+            self.logLink("EA disconnect serial=\(serial) gen=\(generation)")
             self.emitUnexpectedLinkLoss(generation: generation, result: nil)
         }
     }
@@ -576,6 +782,7 @@ class Printer{
     /// Closes the socket that belonged to [generation] and tells Dart once.
     /// A newer connect (higher generation) is left alone; [result] is still completed.
     private func emitUnexpectedLinkLoss(generation: Int, result: FlutterResult?) {
+        logLink("unexpected link loss gen=\(generation) current=\(linkGeneration)")
         linkLock.lock()
         let stillCurrent = generation == linkGeneration
         var shouldEmit = false

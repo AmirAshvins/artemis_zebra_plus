@@ -1,6 +1,11 @@
 #import "BatterySgd.h"
 #import "SGD.h"
 
+static void ZTrace(NSString *message) {
+    NSLog(@"%@", message);
+    printf("%s\n", message.UTF8String);
+}
+
 @implementation BatterySgd
 
 /// Returns YES when Link-OS reports line/AC/mains power (hide battery badge).
@@ -94,6 +99,68 @@
     } @catch (NSException *exception) {
         NSLog(@"[BatterySgd] drain exception: %@", exception);
     }
+}
+
++ (void)disableBluetoothSniffModeIfNeeded:(id<ZebraPrinterConnection, NSObject>)connection {
+    NSString *value = [self _sniffMode:connection];
+    if ([value isEqualToString:@"disabled"]) {
+        return;
+    }
+    // GET has been returning "" or "??" on a socket that just opened, so the
+    // documented setvar was never sent. Write it directly and read the reply.
+    NSString *reply = [self _exchange:@"! U1 setvar \"bluetooth.sniff_mode_enable\" \"disabled\"\r\n"
+                           connection:connection];
+    [NSThread sleepForTimeInterval:0.5];
+    NSString *confirmed = [self _sniffMode:connection];
+    BOOL applied = [confirmed isEqualToString:@"disabled"] ||
+        [reply.lowercaseString containsString:@"disabled"];
+    if (!applied) {
+        ZTrace([NSString stringWithFormat:
+                @"[Zebra] sniff mode not confirmed value='%@' reply='%@'",
+                confirmed, reply ?: @""]);
+        return;
+    }
+    NSError *error = nil;
+    NSString *reset = [SGD DO:@"device.reset"
+                    withValue:@""
+      withPrinterConnection:connection
+      withMaxTimeoutForRead:2000
+andWithTimeToWaitForMoreData:200
+                        error:&error];
+    ZTrace([NSString stringWithFormat:
+            @"[Zebra] printer reset for sniff mode response='%@' error=%@",
+            reset ?: @"nil",
+            error.localizedDescription ?: @"nil"]);
+}
+
++ (NSString *)_exchange:(NSString *)command
+             connection:(id<ZebraPrinterConnection, NSObject>)connection {
+    NSData *data = [command dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *error = nil;
+    NSInteger wrote = [connection write:data error:&error];
+    ZTrace([NSString stringWithFormat:@"[Zebra] sgd write bytes=%ld err=%@",
+                              (long)wrote,
+                              error.localizedDescription ?: @"nil"]);
+    [NSThread sleepForTimeInterval:0.4];
+    NSError *readError = nil;
+    NSData *resp = [connection read:&readError];
+    NSString *text = resp == nil ? @"" : [[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding];
+    ZTrace([NSString stringWithFormat:@"[Zebra] sgd read len=%lu text='%@' err=%@",
+                              (unsigned long)resp.length,
+                              text ?: @"",
+                              readError.localizedDescription ?: @"nil"]);
+    return text ?: @"";
+}
+
++ (NSString *)_sniffMode:(id<ZebraPrinterConnection, NSObject>)connection {
+    NSError *error = nil;
+    NSString *raw = [self _getVar:@"bluetooth.sniff_mode_enable" connection:connection error:&error];
+    NSString *value = [[raw ?: @"" stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    ZTrace([NSString stringWithFormat:@"[Zebra] sniff_mode_enable='%@' error=%@",
+                              value,
+                              error.localizedDescription ?: @"nil"]);
+    return value;
 }
 
 /// Short-timeout SGD GET so a stuck radio cannot hang the Dart poll loop.

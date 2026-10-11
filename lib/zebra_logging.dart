@@ -26,6 +26,13 @@ void zebraPackageLog(String message) {
   dev.log(message, name: 'ArtemisZebra');
 }
 
+/// Always prints. Connect, print, and link-loss traces stay visible while
+/// [ArtemisZebraPlusLogging.silentLogs] still hides the battery poll.
+void zebraTrace(String message) {
+  // ignore: avoid_print
+  print('[Zebra] $message');
+}
+
 /// Prints a diagnostic message when [ArtemisZebraPlusLogging.silentLogs] is false.
 void zebraPackagePrint(String message) {
   if (ArtemisZebraPlusLogging.silentLogs) {

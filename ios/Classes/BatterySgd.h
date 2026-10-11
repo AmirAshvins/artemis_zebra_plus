@@ -15,4 +15,11 @@
 /// Reads battery percent. Nil when unknown or AC-powered. Link errors are ignored.
 + (NSNumber *_Nullable)batteryPercentFromConnection:(id<ZebraPrinterConnection, NSObject>)connection;
 
+/// Turns off Bluetooth sniff mode once, then resets the printer so it sticks.
+///
+/// Newer iPhones drop this radio about every 60 seconds while the setting is
+/// "enabled" (Zebra article 000021307). No-op when it is already "disabled"
+/// or the value cannot be read. The reset drops the link that just opened.
++ (void)disableBluetoothSniffModeIfNeeded:(id<ZebraPrinterConnection, NSObject>)connection;
+
 @end
