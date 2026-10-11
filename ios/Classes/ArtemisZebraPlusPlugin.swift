@@ -7,6 +7,8 @@
    var binaryMessenger: FlutterBinaryMessenger?
 
    public static func register(with registrar: FlutterPluginRegistrar) {
+     // Before any discover/connect. connectedAccessories is empty until this runs.
+     Printer.registerForAccessoryNotifications()
      let channel = FlutterMethodChannel(name: "artemis_zebra_plus", binaryMessenger: registrar.messenger())
      let instance = ArtemisZebraPlusPlugin()
      instance.binaryMessenger = registrar.messenger()

@@ -27,6 +27,14 @@ class Printer{
     private var disconnectObserver: NSObjectProtocol?
     private let linkLock = NSLock()
 
+    /// Link-OS MFi protocol. Accessories without it are not Zebra printers.
+    private static let zebraRawPortProtocol = "com.zebra.rawport"
+    /// `connectedAccessories` and EA disconnect notes stay empty until this runs.
+    private static var didRegisterAccessoryNotifications = false
+    private static let accessoryNotifyLock = NSLock()
+    /// printerFound is async. Discover must not return before Dart records it.
+    private static let discoveryEmitDelay: TimeInterval = 0.5
+
     
     static func getInstance(binaryMessenger : FlutterBinaryMessenger) -> Printer {
         let printer = Printer()
@@ -101,23 +109,97 @@ class Printer{
         connection?.close()
     }
     
+    /// One process-wide registration. Required before `connectedAccessories` is trustworthy.
+    static func registerForAccessoryNotifications() {
+        accessoryNotifyLock.lock()
+        let already = didRegisterAccessoryNotifications
+        if !already {
+            didRegisterAccessoryNotifications = true
+        }
+        accessoryNotifyLock.unlock()
+        guard !already else { return }
+
+        let register = {
+            EAAccessoryManager.shared().registerForLocalNotifications()
+            NSLog("[Zebra] registered for EA accessory notifications")
+        }
+        if Thread.isMainThread {
+            register()
+        } else {
+            DispatchQueue.main.sync(execute: register)
+        }
+    }
+
     func discoverPrinters(result: @escaping FlutterResult){
         dummyConnect()
-        let manager = EAAccessoryManager.shared()
-        let devices = manager.connectedAccessories
-        for d in devices {
-            print("Message from ios: orinter found")
+        Printer.registerForAccessoryNotifications()
 
-            let data = DeviceData(name: d.name, address: d.serialNumber, type: 1,isConnected: d.isConnected)
+        let finish: (Int) -> Void = { count in
+            DispatchQueue.main.asyncAfter(deadline: .now() + Printer.discoveryEmitDelay) {
+                result("Discovery Done Devices Found: " + String(count))
+            }
+        }
 
-            let jsonEncoder = JSONEncoder()
-            let jsonData = try! jsonEncoder.encode(data)
-            let json = String(data: jsonData, encoding: String.Encoding.utf8)
-            self.channel?.invokeMethod("printerFound", arguments: json)
+        // Picker UI and connectedAccessories must be touched on the main thread.
+        let discover = {
+            let found = self.emitConnectedZebraAccessories()
+            if found > 0 {
+                finish(found)
+                return
+            }
+            // One-bar printers drop the idle MFi session but stay paired.
+            // Apple only surfaces those through the system accessory picker.
+            NSLog("[Zebra] no connected rawport accessory — showing Bluetooth picker")
+            EAAccessoryManager.shared().showBluetoothAccessoryPicker(withNameFilter: nil) { error in
+                DispatchQueue.main.async {
+                    if let error = error {
+                        let nsError = error as NSError
+                        NSLog(
+                            "[Zebra] accessory picker error domain=%@ code=%ld %@",
+                            nsError.domain,
+                            CLong(nsError.code),
+                            nsError.localizedDescription
+                        )
+                    }
+                    finish(self.emitConnectedZebraAccessories())
+                }
+            }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            result("Discovery Done Devices Found: "+String(devices.count))
+        if Thread.isMainThread {
+            discover()
+        } else {
+            DispatchQueue.main.async(execute: discover)
         }
+    }
+
+    /// Publishes connected Zebra MFi accessories on this instance channel.
+    ///
+    /// Returns how many were emitted. Non-Zebra accessories are skipped so a
+    /// card reader on the same phone cannot fill the Nearby list.
+    @discardableResult
+    private func emitConnectedZebraAccessories() -> Int {
+        let devices = EAAccessoryManager.shared().connectedAccessories.filter {
+            $0.protocolStrings.contains(Printer.zebraRawPortProtocol)
+        }
+        for accessory in devices {
+            NSLog(
+                "[Zebra] printer found name=%@ serial=%@",
+                accessory.name,
+                accessory.serialNumber
+            )
+            let data = DeviceData(
+                name: accessory.name,
+                address: accessory.serialNumber,
+                type: 1,
+                isConnected: accessory.isConnected
+            )
+            guard let jsonData = try? JSONEncoder().encode(data),
+                  let json = String(data: jsonData, encoding: .utf8) else {
+                continue
+            }
+            channel?.invokeMethod("printerFound", arguments: json)
+        }
+        return devices.count
     }
     
 //    func discoverNetworkPrinters(completion: @escaping ([DiscoveredPrinterNetwork]?) -> Void) {
@@ -172,8 +254,9 @@ class Printer{
 
             // Perform the connection process on a background thread
             DispatchQueue.global(qos: .userInitiated).async {
-                // Determine the type of connection based on the address format
-                if !address.contains(".") {
+                // IP addresses use TCP. MFi serials never contain a dot.
+                let isBluetooth = !address.contains(".")
+                if isBluetooth {
                     self.connection = MfiBtPrinterConnection(serialNumber: address)
                 } else {
                     self.connection = TcpPrinterConnection(address: address, andWithPort: 9100)
@@ -182,7 +265,16 @@ class Printer{
                 // Introduce a small delay before attempting to open the connection
                 Thread.sleep(forTimeInterval: 1)
 
-                let isOpen = self.connection?.open()
+                var isOpen = self.connection?.open()
+
+                // A one-bar radio often refuses the first MFi open and accepts the next.
+                if isBluetooth && isOpen != true {
+                    NSLog("[Zebra] MFi open failed serial=%@ — retrying once", address)
+                    self.connection?.close()
+                    Thread.sleep(forTimeInterval: 1)
+                    self.connection = MfiBtPrinterConnection(serialNumber: address)
+                    isOpen = self.connection?.open()
+                }
 
                 DispatchQueue.main.async {
                     self.isConnecting = false
@@ -205,6 +297,11 @@ class Printer{
                     }
                 }
             }
+        } else {
+            // Leaving this result pending wedges the method channel until the
+            // in-flight open returns, which a slow low-battery radio may not.
+            NSLog("[Zebra] connect ignored, already connecting address=%@", address)
+            result(false)
         }
     }
     
