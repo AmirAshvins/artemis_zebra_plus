@@ -4,6 +4,13 @@
 /// Link-OS SGD battery helpers.
 @interface BatterySgd : NSObject
 
+/// When YES, [Zebra] diagnostics are dropped. Defaults to YES so a host
+/// that never calls through still stays quiet.
++ (void)setSilentLogs:(BOOL)silent;
+
+/// Writes one diagnostic line when silent logs are off.
++ (void)logMessage:(NSString *_Nullable)message;
+
 /// Reads battery percent over an open Link-OS connection.
 ///
 /// [linkFailed] is set to YES only when the transport errors and no SGD scalar

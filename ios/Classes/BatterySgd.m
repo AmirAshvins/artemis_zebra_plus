@@ -1,12 +1,24 @@
 #import "BatterySgd.h"
 #import "SGD.h"
 
+static BOOL zebraLogsSilent = YES;
+
 static void ZTrace(NSString *message) {
-    NSLog(@"%@", message);
-    printf("%s\n", message.UTF8String);
+    [BatterySgd logMessage:message];
 }
 
 @implementation BatterySgd
+
++ (void)setSilentLogs:(BOOL)silent {
+    zebraLogsSilent = silent;
+}
+
++ (void)logMessage:(NSString *)message {
+    if (zebraLogsSilent || message.length == 0) {
+        return;
+    }
+    NSLog(@"%@", message);
+}
 
 /// Returns YES when Link-OS reports line/AC/mains power (hide battery badge).
 + (BOOL)_isAcPowerSource:(NSString *)source {

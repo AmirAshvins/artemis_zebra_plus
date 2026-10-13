@@ -11,6 +11,11 @@ import Flutter
 
 
 class Printer{
+
+    /// Host-controlled. Native traces stay off until `setSilentLogs` arrives.
+    static func diagnostic(_ message: String) {
+        BatterySgd.logMessage(message)
+    }
     
     var connection : ZebraPrinterConnection?
     var channel : FlutterMethodChannel?
@@ -151,7 +156,7 @@ class Printer{
         let register = {
             EAAccessoryManager.shared().registerForLocalNotifications()
             Printer.installAccessoryConnectObserver()
-            NSLog("[Zebra] registered for EA accessory notifications")
+            Printer.diagnostic("[Zebra] registered for EA accessory notifications")
         }
         if Thread.isMainThread {
             register()
@@ -174,12 +179,8 @@ class Printer{
         ) { note in
             guard let accessory = note.userInfo?[EAAccessoryKey] as? EAAccessory else { return }
             guard accessory.protocolStrings.contains(zebraRawPortProtocol) else { return }
-            NSLog(
-                "[Zebra] EAAccessory connected name=%@ serial=%@ id=%ld accOpen=%d",
-                accessory.name,
-                accessory.serialNumber,
-                CLong(accessory.connectionID),
-                accessory.isConnected ? 1 : 0
+            Printer.diagnostic(
+                "[Zebra] EAAccessory connected name=\(accessory.name) serial=\(accessory.serialNumber) id=\(accessory.connectionID) accOpen=\(accessory.isConnected ? 1 : 0)"
             )
             livePrintersLock.lock()
             livePrinters.removeAll { $0.printer == nil }
@@ -259,7 +260,7 @@ class Printer{
                     "\($0.serialNumber)/\($0.name)/id=\($0.connectionID)/accOpen=\($0.isConnected)"
                 }
                 .joined(separator: " | ")
-            print(
+            Printer.diagnostic(
                 "[Zebra] \(reason) instance=\(self.toString()) connecting=\(self.isConnecting ? 1 : 0) inflight=\(self.connectInFlightAddress ?? "-") waiters=\(self.connectWaiters.count) gen=\(self.linkGeneration) socket=\(socketDesc)(\(socketOpen)) saved=\(self.selectedIPAddress ?? "-") ea=[\(accessories.isEmpty ? "none" : accessories)]"
             )
         }
@@ -310,21 +311,21 @@ class Printer{
         Printer.registerForAccessoryNotifications()
         let present = {
             if Printer.accessoryPickerVisible {
-                print("[Zebra] accessory picker already visible")
+                Printer.diagnostic("[Zebra] accessory picker already visible")
                 result(true)
                 return
             }
             Printer.accessoryPickerVisible = true
             result(true)
             DispatchQueue.main.async {
-                print("[Zebra] showing Bluetooth accessory picker")
+                Printer.diagnostic("[Zebra] showing Bluetooth accessory picker")
                 EAAccessoryManager.shared().showBluetoothAccessoryPicker(withNameFilter: nil) { error in
                     DispatchQueue.main.async {
                         Printer.accessoryPickerVisible = false
                         if let error = error as NSError? {
-                            print("[Zebra] picker closed domain=\(error.domain) code=\(error.code) \(error.localizedDescription)")
+                            Printer.diagnostic("[Zebra] picker closed domain=\(error.domain) code=\(error.code) \(error.localizedDescription)")
                         } else {
-                            print("[Zebra] picker closed without error")
+                            Printer.diagnostic("[Zebra] picker closed without error")
                         }
                         self.emitConnectedZebraAccessories()
                         self.logLink("picker finished")
@@ -342,10 +343,8 @@ class Printer{
     /// Publishes one connected Zebra MFi accessory on this instance channel.
     private func emitZebraAccessory(_ accessory: EAAccessory) {
         guard accessory.protocolStrings.contains(Printer.zebraRawPortProtocol) else { return }
-        NSLog(
-            "[Zebra] printer found name=%@ serial=%@",
-            accessory.name,
-            accessory.serialNumber
+        Printer.diagnostic(
+            "[Zebra] printer found name=\(accessory.name) serial=\(accessory.serialNumber)"
         )
         let data = DeviceData(
             name: accessory.name,
@@ -405,18 +404,18 @@ class Printer{
     }
     
     func connectToPrinter(address: String,result: @escaping FlutterResult){
-        print("connecting instance  \(self.toString()) to " + address)
+        Printer.diagnostic("connecting instance  \(self.toString()) to " + address)
         linkLock.lock()
         if self.isConnecting {
             if self.connectInFlightAddress == address {
                 self.connectWaiters.append(result)
                 linkLock.unlock()
-                NSLog("[Zebra] connect joined in-flight address=%@", address)
+                Printer.diagnostic("[Zebra] connect joined in-flight address=\(address)")
                 return
             }
             linkLock.unlock()
             // A different address cannot share this attempt.
-            NSLog("[Zebra] connect ignored, already connecting address=%@", address)
+            Printer.diagnostic("[Zebra] connect ignored, already connecting address=\(address)")
             result(false)
             return
         }
@@ -571,7 +570,7 @@ class Printer{
     }
     
     func printData(data: NSString, result: @escaping FlutterResult) {
-        print("sending from  \(self.toString()) to " + (self.connection?.toString() ?? "unknown"))
+        Printer.diagnostic("sending from  \(self.toString()) to " + (self.connection?.toString() ?? "unknown"))
         DispatchQueue.global(qos: .utility).async {
             let dataBytes = Data(bytes: data.utf8String!, count: data.length)
             if self.isZebraPrinter == true {
@@ -590,7 +589,7 @@ class Printer{
                 let r = connection.write(dataBytes, error: &error)
                 self.logLink("print write bytes=\(r) err=\(error?.localizedDescription ?? "nil")")
                 if r == -1 {
-                    print(error ?? "write failed")
+                    Printer.diagnostic("\(error?.localizedDescription ?? "write failed")")
                     let closed = !self.zebraSocketIsOpen(connection) || self.isConnecting
                     if closed {
                         DispatchQueue.main.async { result(false) }
@@ -640,11 +639,10 @@ class Printer{
         } else {
             connDesc = "other"
         }
-        NSLog("[Zebra checkPrinterStatus] ENTER instance=%@ sgdOnly=%@ connection=%@",
-              self.toString(), sgdOnly ? "true" : "false", connDesc)
+        Printer.diagnostic("[Zebra checkPrinterStatus] ENTER instance=\(self.toString()) sgdOnly=\(sgdOnly ? "true" : "false") connection=\(connDesc)")
 
         if(self.connection==nil){
-            NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (nil) instance=%@", self.toString())
+            Printer.diagnostic("[Zebra checkPrinterStatus] EXIT Not Connected (nil) instance=\(self.toString())")
             if sgdOnly {
                 self.emitUnexpectedLinkLoss(generation: generation, result: result)
             } else {
@@ -655,7 +653,7 @@ class Printer{
         if let zebraPrinterConnection = self.connection as? TcpPrinterConnection {
             if !zebraPrinterConnection.isConnected() {
                 if sgdOnly {
-                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (TCP dead, sgdOnly) instance=%@", self.toString())
+                    Printer.diagnostic("[Zebra checkPrinterStatus] EXIT Not Connected (TCP dead, sgdOnly) instance=\(self.toString())")
                     self.emitUnexpectedLinkLoss(generation: generation, result: result)
                     return
                 }
@@ -663,21 +661,21 @@ class Printer{
             }
             if sgdOnly {
                 if let json = self.sgdPollJson(zebraPrinterConnection) {
-                    NSLog("[Zebra checkPrinterStatus] EXIT TCP instance=%@ jsonLen=%ld", self.toString(), json.count)
+                    Printer.diagnostic("[Zebra checkPrinterStatus] EXIT TCP instance=\(self.toString()) jsonLen=\(json.count)")
                     result(json)
                 } else {
-                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (TCP SGD) instance=%@", self.toString())
+                    Printer.diagnostic("[Zebra checkPrinterStatus] EXIT Not Connected (TCP SGD) instance=\(self.toString())")
                     self.emitUnexpectedLinkLoss(generation: generation, result: result)
                 }
                 return
             }
             let json = self.statusJson(tcp: zebraPrinterConnection, transport: "TCP", sgdOnly: sgdOnly)
-            NSLog("[Zebra checkPrinterStatus] EXIT TCP instance=%@ jsonLen=%ld", self.toString(), json.count)
+            Printer.diagnostic("[Zebra checkPrinterStatus] EXIT TCP instance=\(self.toString()) jsonLen=\(json.count)")
             result(json)
         } else if let zebraPrinterConnection = self.connection as? MfiBtPrinterConnection {
             if !zebraPrinterConnection.isConnected() {
                 if sgdOnly {
-                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (BT dead, sgdOnly) instance=%@", self.toString())
+                    Printer.diagnostic("[Zebra checkPrinterStatus] EXIT Not Connected (BT dead, sgdOnly) instance=\(self.toString())")
                     self.emitUnexpectedLinkLoss(generation: generation, result: result)
                     return
                 }
@@ -685,20 +683,20 @@ class Printer{
             }
             if sgdOnly {
                 if let json = self.sgdPollJson(zebraPrinterConnection) {
-                    NSLog("[Zebra checkPrinterStatus] EXIT BT instance=%@ jsonLen=%ld", self.toString(), json.count)
+                    Printer.diagnostic("[Zebra checkPrinterStatus] EXIT BT instance=\(self.toString()) jsonLen=\(json.count)")
                     result(json)
                 } else {
-                    NSLog("[Zebra checkPrinterStatus] EXIT Not Connected (BT SGD) instance=%@", self.toString())
+                    Printer.diagnostic("[Zebra checkPrinterStatus] EXIT Not Connected (BT SGD) instance=\(self.toString())")
                     self.emitUnexpectedLinkLoss(generation: generation, result: result)
                 }
                 return
             }
             let json = self.statusJson(bt: zebraPrinterConnection, transport: "BT", sgdOnly: sgdOnly)
-            NSLog("[Zebra checkPrinterStatus] EXIT BT instance=%@ jsonLen=%ld", self.toString(), json.count)
+            Printer.diagnostic("[Zebra checkPrinterStatus] EXIT BT instance=\(self.toString()) jsonLen=\(json.count)")
             result(json)
         }
         else {
-            NSLog("[Zebra checkPrinterStatus] EXIT Not TCP instance=%@", self.toString())
+            Printer.diagnostic("[Zebra checkPrinterStatus] EXIT Not TCP instance=\(self.toString())")
             if sgdOnly {
                 self.emitUnexpectedLinkLoss(generation: generation, result: result)
             } else {
@@ -766,7 +764,7 @@ class Printer{
             guard let self = self else { return }
             guard let accessory = note.userInfo?[EAAccessoryKey] as? EAAccessory else { return }
             guard accessory.serialNumber == serial else { return }
-            NSLog("[Zebra] EAAccessory disconnected serial=%@", serial)
+            Printer.diagnostic("[Zebra] EAAccessory disconnected serial=\(serial)")
             self.logLink("EA disconnect serial=\(serial) gen=\(generation)")
             self.emitUnexpectedLinkLoss(generation: generation, result: nil)
         }
@@ -895,13 +893,11 @@ class Printer{
                 )
             } catch {
                 // ZEBRA_MALFORMED_PRINTER_STATUS_RESPONSE etc. — keep defaults and still read SGD.
-                NSLog("[Zebra checkPrinterStatus] %@ getCurrentStatus failed: %@ — reading SGD battery anyway",
-                      transport, error.localizedDescription)
+                Printer.diagnostic("[Zebra checkPrinterStatus] \(transport) getCurrentStatus failed: \(error.localizedDescription) — reading SGD battery anyway")
             }
         }
         status.batteryPercent = readBattery()
-        NSLog("[Zebra checkPrinterStatus] %@ sgdOnly=%@ batteryPercent=%@",
-              transport, sgdOnly ? "true" : "false", status.batteryPercent.map { "\($0)" } ?? "nil")
+        Printer.diagnostic("[Zebra checkPrinterStatus] \(transport) sgdOnly=\(sgdOnly ? "true" : "false") batteryPercent=\(status.batteryPercent.map { "\($0)" } ?? "nil")")
         let jsonEncoder = JSONEncoder()
         let jsonData = try! jsonEncoder.encode(status)
         return String(data: jsonData, encoding: String.Encoding.utf8) ?? "{}"
@@ -1044,7 +1040,7 @@ class Printer{
         }}
     
     private func showAlert(title: String, message: String) {
-        print("sending from  \(title) to " + (message))
+        Printer.diagnostic("sending from  \(title) to " + (message))
     }
     
     
@@ -1063,7 +1059,7 @@ struct DeviceData: Codable {
 
 class MyResponseValidator: NSObject,ResponseValidator {
     func isResponseComplete(_ data: Data!) -> Bool {
-        print(data)
+        Printer.diagnostic("\(String(describing: data))")
         return true
     }
     
@@ -1120,7 +1116,7 @@ class MyPrinterStatus: Codable {
             let jsonData = try encoder.encode(self)
             return String(data: jsonData, encoding: .utf8)
         } catch {
-            print("Error encoding object to JSON: \(error)")
+            Printer.diagnostic("Error encoding object to JSON: \(error)")
             return nil
         }
     }

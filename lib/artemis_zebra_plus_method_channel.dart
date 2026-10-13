@@ -25,19 +25,17 @@ class MethodChannelArtemisZebraPlus extends ArtemisZebraPlusPlatform {
     // return result;
   }
 
-
   @override
   Future<String?> discoverPrinters() async {
-
     final result = await methodChannel.invokeMethod<String>('discoverPrinters');
     return result;
   }
 
   @override
-  Future<ZebraPrinter> getZebraPrinterInstance({String? label, required void Function(ZebraPrinter) notifier,Function? statusListener}) async {
+  Future<ZebraPrinter> getZebraPrinterInstance({String? label, required void Function(ZebraPrinter) notifier, Function? statusListener}) async {
     getPermissions();
     String id = await methodChannel.invokeMethod("getInstance");
-    ZebraPrinter printer = ZebraPrinter(id, label: label, notifierFunction: notifier,statusListener: statusListener);
+    ZebraPrinter printer = ZebraPrinter(id, label: label, notifierFunction: notifier, statusListener: statusListener);
     zebraPackagePrint("${printer.instanceID}");
 
     return printer;
@@ -50,17 +48,6 @@ class MethodChannelArtemisZebraPlus extends ArtemisZebraPlusPlatform {
     //     Permission.bluetoothAdvertise.isGranted &&
     //     Permission.bluetoothConnect.isGranted &&
     //     Permission.bluetoothScan.isGranted) return;
-    Map<Permission, PermissionStatus> statuses = await [
-      Permission.location,
-      Permission.bluetooth,
-      Permission.bluetoothAdvertise,
-      Permission.bluetoothConnect,
-      Permission.bluetoothScan,
-    ].request();
-    // print(statuses[Permission.location]);
-    // print(statuses[Permission.bluetooth]);
-    // print(statuses[Permission.bluetoothAdvertise]);
-    // print(statuses[Permission.bluetoothConnect]);
-    // print(statuses[Permission.bluetoothScan]);
+    Map<Permission, PermissionStatus> statuses = await [Permission.location, Permission.bluetooth, Permission.bluetoothAdvertise, Permission.bluetoothConnect, Permission.bluetoothScan].request();
   }
 }

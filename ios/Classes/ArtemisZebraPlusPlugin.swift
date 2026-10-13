@@ -20,6 +20,11 @@
            case "getInstance":
                getInstance(result: result);
                break
+           case "setSilentLogs":
+               let silent = call.arguments as? Bool ?? true
+               BatterySgd.setSilentLogs(silent)
+               result(nil)
+               break
            default:
                result("Unimplemented Method")
            }

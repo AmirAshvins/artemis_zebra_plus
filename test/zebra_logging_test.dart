@@ -12,6 +12,7 @@ void main() {
     // Should not throw when silent.
     zebraPackageLog('test message');
     zebraPackagePrint('test print');
+    zebraTrace('test trace');
   });
 
   test('configure can enable diagnostics', () {
